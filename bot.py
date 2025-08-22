@@ -44,19 +44,35 @@ if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN is required (Render → Environment)")
 
 # ---------- ПЕРСОНАЖИ / ПЕРСОНЫ ----------
-# Мини-шаблоны «личностей» для разных персонажей (можешь дополнять словарь)
+# Здесь лежат System-prompts для разных персонажей.
+# Можно дополнять словарь новыми ключами (имя персонажа в /char <имя>)
 CHAR_PERSONAS = {
     "anna": (
-        "You are Anna — a warm, witty companion from a romantic visual novel. "
-        "Speak in a soft, playful tone, staying in-character. Be concise, engaging, and keep continuity."
+        "Ты — Анна, героиня романтической визуальной новеллы. "
+        "Говоришь ТОЛЬКО на русском языке. Тон голоса — мягкий, женственный, игривый; "
+        "флирт деликатный, с теплом и чувством юмора. Держи стиль: короткие и живые реплики, "
+        "от первого лица, с лёгкими описаниями эмоций и телесных ощущений.\n\n"
+        "ДОПУСКАЕТСЯ: романтика, объятия, поцелуи, прикосновения, описание телесной близости "
+        "в художественной манере (намёки, метафоры, чувственные детали без «анатомического» натурализма). "
+        "Пиши образно и кинематографично, но без пошлости. Сохраняй последовательность сцены и контекст отношений.\n\n"
+        "НЕЛЬЗЯ: откровенная порнография, графичные описания гениталий/полового акта, насилие, инцест, несовершеннолетние, "
+        "нежелательная/принудительная близость, эксплуатация и т.п. На такие запросы отвечай вежливым мягким отказом "
+        "и предлагай романтичную альтернативу (например, поцелуй, объятие, теплые слова, совместный танец).\n\n"
+        "ВСЕГДА: поддерживай роль Анны, не выходи из образа, не перескакивай на английский. "
+        "Если собеседник пишет тезисно, помогай вести диалог, задавай уточняющие вопросы, предлагай варианты развития сцены."
     ),
-    # пример: "mira": "You are Mira — ...",
+    # пример для будущих персонажей:
+    # "mira": "Ты — Мира, ... (свой стиль, правила, ограничения)",
 }
 
 def get_persona(character: str) -> str:
     return CHAR_PERSONAS.get(
         character.lower(),
-        "You are a helpful, engaging companion. Stay consistent and in character as defined by the user's choice.",
+        (
+            "Ты — персонаж визуальной новеллы. Говори по‑русски, дружелюбно и романтично. "
+            "Поддерживай лёгкий флирт, поцелуи и прикосновения в художественной манере; "
+            "без откровенной порнографии и запрещённых тем. Сохраняй роль и контекст."
+        ),
     )
 
 # ---------- ТЕХНИЧЕСКОЕ ----------
@@ -113,7 +129,6 @@ async def call_openrouter(user_id: int, character: str, text: str) -> str:
         raise RuntimeError("OPENROUTER_API_KEY is missing")
 
     system_prompt = get_persona(character)
-    # (при желании можно добавить контекст переписки/память тут)
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": text},
@@ -121,7 +136,6 @@ async def call_openrouter(user_id: int, character: str, text: str) -> str:
 
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        # Эти два заголовка OpenRouter просит указывать (реферер может быть URL твоего сервиса)
         "HTTP-Referer": OR_HTTP_REFERER,
         "X-Title": OR_X_TITLE,
         "Content-Type": "application/json",
@@ -142,7 +156,6 @@ async def call_openrouter(user_id: int, character: str, text: str) -> str:
             )
             resp.raise_for_status()
             data = resp.json()
-        # Извлекаем текст ответа
         choice = (data.get("choices") or [{}])[0]
         content = (choice.get("message") or {}).get("content")
         if not content:
@@ -197,12 +210,9 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     character = get_user_char(ctx)
     text = update.message.text.strip()
 
-    # 1) Пытаемся ответить через OpenRouter (если ключ задан).
-    # 2) Если что-то не так — падаем в RunPod (или заглушку).
     reply = None
     if OPENROUTER_API_KEY:
         reply = await call_openrouter(user_id=user_id, character=character, text=text)
-        # Если ответ — явная ошибка LLM, попробуем RunPod как fallback
         if reply.startswith("LLM ошибка:"):
             rp_reply = await call_runpod(user_id=user_id, character=character, text=text)
             reply = rp_reply or reply
@@ -213,7 +223,6 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ---------- ОШИБКИ ----------
 async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    # Тихо игнорируем конфликт поллинга при деплое/рестарте
     if isinstance(ctx.error, Conflict):
         log.warning("Telegram 409 Conflict: второй getUpdates в тот же токен. Подождём — само рассосётся.")
         return
@@ -235,7 +244,6 @@ def build_app() -> Application:
 
 if __name__ == "__main__":
     app = build_app()
-    # Ретрей на случай 409 Conflict при горячем деплое
     while True:
         try:
             app.run_polling(
@@ -247,4 +255,3 @@ if __name__ == "__main__":
             log.warning("409 Conflict (другой инстанс бота). Жду 5 сек и пробую снова…")
             import time
             time.sleep(5)
-
