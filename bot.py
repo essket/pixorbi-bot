@@ -25,8 +25,7 @@ log = logging.getLogger("pixorbi-bot")
 # ВАЖНО: имя переменной для токена — именно TELEGRAM_BOT_TOKEN
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
-# НОВОЕ: вместо полного URL используем ID эндпоинта
-# его видно на странице RunPod Serverless, выглядит как ehcln4zeklsxdu
+# Вместо полного URL используем ID эндпоинта RunPod (пример: ehcln4zeklsxdu)
 RUNPOD_ENDPOINT_ID = os.getenv("RUNPOD_ENDPOINT_ID")
 
 # Ключ API RunPod (обязательно)
@@ -131,6 +130,10 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ---------- ОШИБКИ ----------
 async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    # Тихо игнорируем конфликт поллинга при деплое/рестарте
+    if isinstance(ctx.error, Conflict):
+        log.warning("Telegram 409 Conflict: второй getUpdates в тот же токен. Подождём — само рассосётся.")
+        return
     log.exception("Unhandled error", exc_info=ctx.error)
     try:
         if isinstance(update, Update) and update.effective_message:
