@@ -22,29 +22,44 @@ logging.basicConfig(
 log = logging.getLogger("pixorbi-bot")
 
 # ---------- ENV ----------
-# ВАЖНО: имя переменной для токена — именно TELEGRAM_BOT_TOKEN
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
-# Вместо полного URL используем ID эндпоинта RunPod (пример: ehcln4zeklsxdu)
+# RunPod (для связки с серверной логикой/генерацией картинок и т.п.)
 RUNPOD_ENDPOINT_ID = os.getenv("RUNPOD_ENDPOINT_ID")
-
-# Ключ API RunPod (обязательно)
 RUNPOD_API_KEY = os.getenv("RUNPOD_API_KEY")
+RUNPOD_RUNSYNC_URL = (
+    f"https://api.runpod.ai/v2/{RUNPOD_ENDPOINT_ID}/runsync" if RUNPOD_ENDPOINT_ID else None
+)
+
+# OpenRouter (LLM для диалогов)
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.1-70b-instruct")
+OR_HTTP_REFERER = os.getenv("OR_HTTP_REFERER", "https://pixorbibot.onrender.com")
+OR_X_TITLE = os.getenv("OR_X_TITLE", "PixorbiDream")
 
 DEFAULT_CHAR = os.getenv("DEFAULT_CHARACTER", "anna").lower()
 CHAR_KEY = "char"
 
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN is required (Render → Environment)")
-if not RUNPOD_ENDPOINT_ID:
-    raise RuntimeError("RUNPOD_ENDPOINT_ID is required (Render → Environment)")
-if not RUNPOD_API_KEY:
-    raise RuntimeError("RUNPOD_API_KEY is required (Render → Environment)")
 
-# Собираем правильный runsync URL:
-RUNPOD_RUNSYNC_URL = f"https://api.runpod.ai/v2/{RUNPOD_ENDPOINT_ID}/runsync"
+# ---------- ПЕРСОНАЖИ / ПЕРСОНЫ ----------
+# Мини-шаблоны «личностей» для разных персонажей (можешь дополнять словарь)
+CHAR_PERSONAS = {
+    "anna": (
+        "You are Anna — a warm, witty companion from a romantic visual novel. "
+        "Speak in a soft, playful tone, staying in-character. Be concise, engaging, and keep continuity."
+    ),
+    # пример: "mira": "You are Mira — ...",
+}
 
-# ---------- ВСПОМОГАТЕЛЬНЫЕ ----------
+def get_persona(character: str) -> str:
+    return CHAR_PERSONAS.get(
+        character.lower(),
+        "You are a helpful, engaging companion. Stay consistent and in character as defined by the user's choice.",
+    )
+
+# ---------- ТЕХНИЧЕСКОЕ ----------
 async def delete_webhook(app: Application) -> None:
     try:
         await app.bot.delete_webhook(drop_pending_updates=True)
@@ -52,8 +67,12 @@ async def delete_webhook(app: Application) -> None:
     except Exception as e:
         log.warning("delete_webhook failed: %s", e)
 
+# ----- RunPod вызов (опционально) -----
 async def call_runpod(user_id: int, character: str, text: str) -> str:
-    """Синхронный вызов Serverless через /runsync."""
+    """Вызов Serverless через /runsync. Если RunPod не настроен — возвращаем простую заглушку."""
+    if not (RUNPOD_RUNSYNC_URL and RUNPOD_API_KEY):
+        return f"{character.title()}: я услышала тебя — «{text}»."
+
     payload = {
         "input": {
             "user_id": str(user_id),
@@ -72,7 +91,6 @@ async def call_runpod(user_id: int, character: str, text: str) -> str:
             resp.raise_for_status()
             data = resp.json()
 
-        # Унифицируем поле с ответом
         output = data.get("output") if isinstance(data, dict) else data
         if isinstance(output, dict):
             if "reply" in output:
@@ -83,14 +101,68 @@ async def call_runpod(user_id: int, character: str, text: str) -> str:
 
     except httpx.HTTPStatusError as e:
         log.exception("RunPod HTTP error")
-        return (
-            f"Упс… ошибка сервера: {e.response.status_code} {e.response.reason_phrase}\n"
-            f"{e.request.url}"
-        )
+        return f"Упс… ошибка сервера: {e.response.status_code} {e.response.reason_phrase}\n{e.request.url}"
     except Exception as e:
         log.exception("RunPod error")
         return f"Упс… ошибка сервера: {e}"
 
+# ----- OpenRouter вызов (LLM-диалог) -----
+async def call_openrouter(user_id: int, character: str, text: str) -> str:
+    """Диалог через OpenRouter. Если ключа нет — бросаем исключение, чтобы вызвать fallback на RunPod."""
+    if not OPENROUTER_API_KEY:
+        raise RuntimeError("OPENROUTER_API_KEY is missing")
+
+    system_prompt = get_persona(character)
+    # (при желании можно добавить контекст переписки/память тут)
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": text},
+    ]
+
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        # Эти два заголовка OpenRouter просит указывать (реферер может быть URL твоего сервиса)
+        "HTTP-Referer": OR_HTTP_REFERER,
+        "X-Title": OR_X_TITLE,
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": OPENROUTER_MODEL,
+        "messages": messages,
+        "temperature": 0.8,
+        "max_tokens": 256,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
+            resp = await client.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers=headers,
+                json=payload,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        # Извлекаем текст ответа
+        choice = (data.get("choices") or [{}])[0]
+        content = (choice.get("message") or {}).get("content")
+        if not content:
+            return f"{character.title()}: (пустой ответ модели)"
+        return content.strip()
+    except httpx.HTTPStatusError as e:
+        log.exception("OpenRouter HTTP error")
+        code = e.response.status_code
+        reason = e.response.reason_phrase
+        detail = ""
+        try:
+            detail = e.response.text[:300]
+        except Exception:
+            pass
+        return f"LLM ошибка: {code} {reason}\n{detail}"
+    except Exception as e:
+        log.exception("OpenRouter error")
+        return f"LLM ошибка: {e}"
+
+# ---------- УТИЛИТЫ ----------
 def get_user_char(ctx: ContextTypes.DEFAULT_TYPE) -> str:
     char = ctx.user_data.get(CHAR_KEY)
     if not char:
@@ -102,8 +174,8 @@ def get_user_char(ctx: ContextTypes.DEFAULT_TYPE) -> str:
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     ctx.user_data.setdefault(CHAR_KEY, DEFAULT_CHAR)
     await update.message.reply_text(
-        "Привет! Я подключён к RunPod.\n"
-        "Напиши любой текст — я отправлю его на сервер и верну ответ.\n\n"
+        "Привет! Я подключён к RunPod и OpenRouter.\n"
+        "Напиши любой текст — я ответлю в стиле выбранного персонажа.\n\n"
         "Команды:\n"
         "  /char — показать текущего персонажа\n"
         "  /char <имя> — выбрать персонажа (пример: /char anna)\n\n"
@@ -125,7 +197,18 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     character = get_user_char(ctx)
     text = update.message.text.strip()
 
-    reply = await call_runpod(user_id=user_id, character=character, text=text)
+    # 1) Пытаемся ответить через OpenRouter (если ключ задан).
+    # 2) Если что-то не так — падаем в RunPod (или заглушку).
+    reply = None
+    if OPENROUTER_API_KEY:
+        reply = await call_openrouter(user_id=user_id, character=character, text=text)
+        # Если ответ — явная ошибка LLM, попробуем RunPod как fallback
+        if reply.startswith("LLM ошибка:"):
+            rp_reply = await call_runpod(user_id=user_id, character=character, text=text)
+            reply = rp_reply or reply
+    else:
+        reply = await call_runpod(user_id=user_id, character=character, text=text)
+
     await update.message.reply_text(reply)
 
 # ---------- ОШИБКИ ----------
