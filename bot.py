@@ -143,4 +143,29 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    import logging
+    from telegram import Update
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    )
+
+    # 1) Собираем приложение и регистрируем хендлеры
+    app = build_app()  # <-- эта функция должна возвращать Application со всеми твоими handlers
+
+    # 2) На всякий случай удаляем вебхук, чтобы не было конфликта getUpdates/webhook
+    #    ВАЖНО: это безопасно вызывать перед polling.
+    try:
+        app.run_async(app.bot.delete_webhook(drop_pending_updates=True)).result()
+        logging.info("Webhook deleted (drop_pending_updates=True)")
+    except Exception:
+        logging.exception("Failed to delete webhook (ignored)")
+
+    # 3) Стартуем polling. Здесь НЕ используем asyncio.run/await — PTB сам управляет loop.
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        poll_interval=1.0,
+        stop_signals=None,   # Render сам шлёт SIGTERM, PTB корректно завершится
+        close_loop=True,     # PTB закроет свой цикл сам
+    )
