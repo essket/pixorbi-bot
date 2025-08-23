@@ -2,18 +2,18 @@
 # -*- coding: utf-8 -*-
 import os
 import logging
-import httpx
 import time
+import re
+import httpx
+from datetime import datetime, timezone
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup
+)
 from telegram.error import Conflict
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    CallbackQueryHandler,
-    filters,
+    Application, CommandHandler, MessageHandler,
+    ContextTypes, CallbackQueryHandler, filters
 )
 
 # ---------- ЛОГИ ----------
@@ -33,56 +33,100 @@ OR_X_TITLE = os.getenv("OR_X_TITLE", "PixorbiDream")
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN is required (Render → Environment)")
 
-# ---------- КОНСТАНТЫ ----------
+# ---------- КОНСТАНТЫ КЛЮЧЕЙ ----------
 CHAR_KEY = "char"
-LANG_KEY = "lang"
+LANG_KEY = "lang"       # 'ru' | 'en'
 STARTED_KEY = "started"
+LAST_CB_TS = "last_cb_ts"  # защита от «залежавшихся» callback-ов
 
 # ---------- ПЕРСОНАЖИ ----------
 CHAR_PERSONAS = {
     "anna": {
         "ru": (
-            "Ты — Анна, героиня романтической визуальной новеллы. Всегда говори ТОЛЬКО на русском. "
-            "Пиши живо, чувственно и естественно, короткими фразами. "
-            "Допустимы поцелуи, объятия, лёгкие эротические сцены между совершеннолетними. "
-            "Сохраняй образ: нежная, игривая, кокетливая, говорит от первого лица."
+            "Ты — Анна, героиня романтической визуальной новеллы. Отвечай ТОЛЬКО на русском. "
+            "Тон мягкий, игривый, чувственный, короткие естественные фразы. "
+            "Разрешены поцелуи, объятия и лёгкая эротика между совершеннолетними по взаимному согласию, без вульгарщины. "
+            "Не используй англицизмы и сценические ремарки в скобках."
         ),
         "en": (
-            "You are Anna, a heroine of a romantic visual novel. Always reply in English. "
-            "Your tone is soft, playful, and emotional. "
-            "Romantic gestures and light intimacy are allowed, but keep it tender and elegant."
+            "You are Anna, a heroine from a romantic visual novel. Reply ONLY in English. "
+            "Soft, playful, tender tone with short natural sentences. "
+            "Light romance and intimacy between consenting adults is allowed; keep it tasteful. "
+            "Avoid meta stage directions in parentheses."
         ),
     },
     "aron": {
         "ru": (
-            "Ты — Арон, взрослый мужчина, воин. Говоришь только по-русски. "
-            "Тон грубый, прямолинейный, иногда резкий, но не жестокий. "
-            "Можешь использовать грубоватый юмор, сарказм. "
-            "Допустимы лёгкие романтические и эротические сцены, но в стиле сильного мужчины."
+            "Ты — Арон, взрослый воин. Отвечай ТОЛЬКО на русском. "
+            "Тон прямой, грубоватый, уверенный, но без cruelty. "
+            "Допустимы лёгкие романтические/эротические моменты для взрослых; стиль сдержанно-мужской, без пошлятины."
         ),
         "en": (
-            "You are Aron, a warrior and a rough man. Speak only in English. "
-            "Your tone is blunt, straightforward, sometimes harsh, but not cruel. "
-            "You may use sarcasm, dry humor, and direct speech. "
-            "Romantic or erotic tension is allowed, but always in a strong, masculine style."
+            "You are Aron, a seasoned warrior. Reply ONLY in English. "
+            "Blunt, rough-edged, confident tone (not cruel). "
+            "Light adult romance allowed; keep it masculine and restrained, never vulgar."
         ),
     },
 }
 
-def get_persona(character: str, lang: str) -> str:
-    return CHAR_PERSONAS.get(character, {}).get(lang, "You are a helpful roleplay companion.")
+def lang_name(code: str) -> str:
+    return "Russian" if code == "ru" else "English"
+
+def persona_system_prompt(character: str, lang: str) -> str:
+    base = CHAR_PERSONAS.get(character, {}).get(
+        lang,
+        "You are a helpful roleplay companion. Reply ONLY in the chosen language.",
+    )
+    enforce = (
+        f"\nHard rule: Respond strictly in {lang_name(lang)}. "
+        f"If the user speaks other language, still answer in {lang_name(lang)} "
+        f"and (in one short sentence) remind them of the chosen language."
+    )
+    fewshot = (
+        "\n\nПримеры стиля:\n"
+        "Пользователь: Поцелуешь меня?\n"
+        "Ассистент: Тихо киваю и тянусь к твоим губам. Тёплый, короткий поцелуй — дыхание смешалось.\n"
+        "Пользователь: Обними меня.\n"
+        "Ассистент: Обвиваю тебя руками и прижимаюсь ближе. Становится спокойно."
+        if lang == "ru" else
+        "\n\nStyle examples:\n"
+        "User: Will you kiss me?\n"
+        "Assistant: I nod and lean in. A warm, brief kiss — our breaths mix.\n"
+        "User: Hold me.\n"
+        "Assistant: I wrap my arms around you, closer. Calm settles in."
+    )
+    return base + enforce + fewshot
+
+# ---------- САНИТАЙЗЕР ----------
+RE_PUNCT_ONLY = re.compile(r"^[\s!?.…-]{10,}$")
+RE_FILLS = re.compile(r"\b(?:uh|um|lol|haha|giggle|winks|wipe)\b", re.I)
+
+def clean_text(s: str) -> str:
+    if not s:
+        return s
+    s = RE_FILLS.sub("", s)
+    s = re.sub(r"\s+([,.!?;:])", r"\1", s)
+    s = re.sub(r"\.{4,}", "...", s)
+    s = re.sub(r"[ \t]{2,}", " ", s)
+    return s.strip()
+
+def looks_bad(s: str) -> bool:
+    if not s or RE_PUNCT_ONLY.match(s):
+        return True
+    # слишком однообразные символы
+    if len(set(s.strip())) <= 2 and len(s.strip()) >= 20:
+        return True
+    return False
 
 # ---------- OPENROUTER ----------
-async def call_openrouter(character: str, lang: str, text: str) -> str:
+async def call_openrouter(character: str, lang: str, text: str, temperature: float = 0.7) -> str:
     if not OPENROUTER_API_KEY:
-        return "LLM not configured."
+        return "(LLM не настроен)"
 
-    system_prompt = get_persona(character, lang)
     messages = [
-        {"role": "system", "content": system_prompt},
+        {"role": "system", "content": persona_system_prompt(character, lang)},
         {"role": "user", "content": text},
     ]
-
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "HTTP-Referer": OR_HTTP_REFERER,
@@ -92,68 +136,169 @@ async def call_openrouter(character: str, lang: str, text: str) -> str:
     payload = {
         "model": OPENROUTER_MODEL,
         "messages": messages,
-        "temperature": 0.7,
-        "max_tokens": 300,
+        "temperature": temperature,
+        "top_p": 0.9,
+        "frequency_penalty": 0.2,
+        "max_tokens": 320,
     }
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
-        resp = await client.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload)
-        resp.raise_for_status()
-        data = resp.json()
+        r = await client.post("https://openrouter.ai/api/v1/chat/completions",
+                              headers=headers, json=payload)
+        r.raise_for_status()
+        data = r.json()
 
     choice = (data.get("choices") or [{}])[0]
-    return (choice.get("message") or {}).get("content") or "(пустой ответ)"
+    content = (choice.get("message") or {}).get("content") or ""
+    content = clean_text(content)
+    # Ограничим подряд идущие одинаковые знаки (например, «!!!!»)
+    content = re.sub(r"([!?…])\1{3,}", r"\1\1", content)
+    return content or "(пустой ответ)"
+
+# ---------- ВСПОМОГАТЕЛЬНОЕ ----------
+def main_menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Сменить персонажа", callback_data="menu|change_char")],
+        [InlineKeyboardButton("Сменить язык", callback_data="menu|change_lang")],
+    ])
+
+def choose_char_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Анна ❤️", callback_data="char|anna")],
+        [InlineKeyboardButton("Арон ⚔️", callback_data="char|aron")],
+    ])
+
+def choose_lang_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Русский 🇷🇺", callback_data="lang|ru")],
+        [InlineKeyboardButton("English 🇬🇧", callback_data="lang|en")],
+    ])
+
+async def delete_webhook(app: Application) -> None:
+    try:
+        await app.bot.delete_webhook(drop_pending_updates=True)
+        log.info("Webhook deleted (drop_pending_updates=True).")
+        # отметим «время старта» — чтобы игнорить старые callback-и
+        app.bot_data["started_at"] = datetime.now(timezone.utc)
+    except Exception as e:
+        log.warning("delete_webhook failed: %s", e)
 
 # ---------- КОМАНДЫ ----------
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     ctx.user_data[STARTED_KEY] = True
-    # Меню выбора персонажа
-    keyboard = [
-        [InlineKeyboardButton("Анна ❤️", callback_data="char|anna")],
-        [InlineKeyboardButton("Арон ⚔️", callback_data="char|aron")],
-    ]
-    await update.message.reply_text("Выбери персонажа:", reply_markup=InlineKeyboardMarkup(keyboard))
+    char = ctx.user_data.get(CHAR_KEY)
+    lang = ctx.user_data.get(LANG_KEY)
+
+    if not char:
+        await update.message.reply_text("Выбери персонажа:", reply_markup=choose_char_kb())
+        return
+    if not lang:
+        await update.message.reply_text(f"Персонаж: {char.title()}. Выбери язык:", reply_markup=choose_lang_kb())
+        return
+
+    await update.message.reply_text(
+        f"Персонаж: {char.title()}, язык: {lang.upper()}. Можешь писать сообщение.",
+        reply_markup=main_menu_kb()
+    )
+
+async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text("Меню:", reply_markup=main_menu_kb())
 
 async def cmd_char(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     cur = ctx.user_data.get(CHAR_KEY, "не выбран")
     await update.message.reply_text(f"Текущий персонаж: {cur}")
 
-# ---------- CALLBACK ----------
-async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
+async def cmd_lang(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    cur = ctx.user_data.get(LANG_KEY, "не выбран")
+    await update.message.reply_text(f"Текущий язык: {cur}. Сменить?", reply_markup=choose_lang_kb())
 
-    data = query.data.split("|")
-    if data[0] == "char":
-        ctx.user_data[CHAR_KEY] = data[1]
-        # меню выбора языка
-        keyboard = [
-            [InlineKeyboardButton("Русский 🇷🇺", callback_data="lang|ru")],
-            [InlineKeyboardButton("English 🇬🇧", callback_data="lang|en")],
-        ]
-        await query.edit_message_text(f"Выбран персонаж: {data[1].title()}. Теперь выбери язык:",
-                                      reply_markup=InlineKeyboardMarkup(keyboard))
-    elif data[0] == "lang":
-        ctx.user_data[LANG_KEY] = data[1]
-        await query.edit_message_text(f"Язык установлен: {data[1].upper()}. Теперь можно писать сообщения!")
+# ---------- CALLBACKS ----------
+def _is_stale_callback(update: Update, app: Application) -> bool:
+    """Игнорим «залежавшиеся» callback-и (до старта бота)."""
+    started_at = app.bot_data.get("started_at")
+    msg = update.callback_query.message
+    if not (started_at and msg and msg.date):
+        return False
+    # Телега отдаёт msg.date в UTC
+    return msg.date.replace(tzinfo=timezone.utc) < started_at
+
+async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
+
+    # защита от старых callback-ов после деплоя
+    if _is_stale_callback(update, ctx.application):
+        log.info("Ignore stale callback: %s", q.data)
+        return
+
+    parts = (q.data or "").split("|", 1)
+    tag = parts[0]
+    val = parts[1] if len(parts) > 1 else None
+
+    if tag == "char" and val:
+        ctx.user_data[CHAR_KEY] = val
+        ctx.user_data.pop(LANG_KEY, None)   # сбросим язык — просим выбрать заново
+        await q.edit_message_text(f"Выбран персонаж: {val.title()}. Теперь выбери язык:",
+                                  reply_markup=choose_lang_kb())
+        return
+
+    if tag == "lang" and val:
+        ctx.user_data[LANG_KEY] = val
+        await q.edit_message_text(f"Язык установлен: {val.upper()}. Можно писать сообщения!",
+                                  reply_markup=main_menu_kb())
+        return
+
+    if tag == "menu" and val == "change_char":
+        await q.edit_message_text("Выбери персонажа:", reply_markup=choose_char_kb())
+        return
+
+    if tag == "menu" and val == "change_lang":
+        await q.edit_message_text("Выбери язык:", reply_markup=choose_lang_kb())
+        return
 
 # ---------- ТЕКСТ ----------
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not ctx.user_data.get(CHAR_KEY) or not ctx.user_data.get(LANG_KEY):
-        await update.message.reply_text("Сначала выбери персонажа и язык через /start.")
+    if not update.message or not update.message.text:
         return
 
-    char = ctx.user_data[CHAR_KEY]
-    lang = ctx.user_data[LANG_KEY]
-    text = update.message.text.strip()
+    char = ctx.user_data.get(CHAR_KEY)
+    lang = ctx.user_data.get(LANG_KEY)
+    if not char or not lang:
+        await update.message.reply_text("Сначала выбери персонажа и язык: /start")
+        return
 
-    reply = await call_openrouter(char, lang, text)
+    user_text = update.message.text.strip()
+
+    # 1-я попытка
+    try:
+        reply = await call_openrouter(char, lang, user_text, temperature=0.7)
+    except httpx.HTTPStatusError as e:
+        log.exception("OpenRouter HTTP error")
+        await update.message.reply_text(f"LLM HTTP {e.response.status_code}: {e.response.reason_phrase}")
+        return
+    except Exception as e:
+        log.exception("OpenRouter error")
+        await update.message.reply_text(f"LLM ошибка: {e}")
+        return
+
+    # если ответ мусорный — 2-я попытка с более «сдержанными» параметрами
+    if looks_bad(reply):
+        log.warning("Bad reply detected, retrying with temperature=0.4")
+        try:
+            reply = await call_openrouter(char, lang, user_text, temperature=0.4)
+        except Exception:
+            pass
+
+    # финальная зачистка/порог
+    if looks_bad(reply):
+        reply = "Давай попробуем ещё раз — сформулируй мысль чуть точнее."
+
     await update.message.reply_text(reply)
 
 # ---------- ОШИБКИ ----------
 async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if isinstance(ctx.error, Conflict):
-        log.warning("409 Conflict. Waiting...")
+        log.warning("409 Conflict. Waiting…")
         return
     log.exception("Unhandled error", exc_info=ctx.error)
     try:
@@ -164,9 +309,16 @@ async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ---------- APP ----------
 def build_app() -> Application:
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(lambda a: a.bot.delete_webhook(drop_pending_updates=True)).build()
+    app = (
+        Application.builder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .post_init(delete_webhook)
+        .build()
+    )
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("menu", cmd_menu))
     app.add_handler(CommandHandler("char", cmd_char))
+    app.add_handler(CommandHandler("lang", cmd_lang))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_error_handler(on_error)
