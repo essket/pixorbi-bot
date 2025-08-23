@@ -37,10 +37,8 @@ def _as_bool(v: str | None, default=False) -> bool:
         return default
     return v.strip().lower() in {"1", "true", "yes", "y", "on"}
 
-# При каждом /start заново просить выбрать персонажа/язык?
 FORCE_RESELECT_ON_START = _as_bool(os.getenv("FORCE_RESELECT_ON_START"), True)
 
-# После скольких «не тем языком» показывать кнопки смены языка
 try:
     LANG_SWITCH_THRESHOLD = max(1, int(os.getenv("LANG_SWITCH_THRESHOLD", "3")))
 except Exception:
@@ -49,12 +47,15 @@ except Exception:
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN is required (Render → Environment)")
 
-# ---------- КЛЮЧИ ----------
+# ---------- КЛЮЧИ / КОНСТАНТЫ ----------
 CHAR_KEY = "char"
-LANG_KEY = "lang"                  # 'ru' | 'en'
+LANG_KEY = "lang"
 STARTED_KEY = "started"
-AWAIT_SETUP = "await_setup"        # пока не выбран(ы) персонаж/язык — True
+AWAIT_SETUP = "await_setup"
 LANG_MISMATCH_STREAK = "lang_mismatch_streak"
+
+DIALOG_HISTORY = "dialog_history"
+HIST_MAX_TURNS = 12  # хранить до 12 пользовательских + 12 ответов
 
 # ---------- ПЕРСОНАЖИ ----------
 CHAR_PERSONAS = {
@@ -96,8 +97,23 @@ def persona_system_prompt(character: str, lang: str) -> str:
     )
     enforce = (
         f"\nHard rule: Respond strictly in {lang_name(lang)}. "
-        f"If the user speaks other language, still answer in {lang_name(lang)} "
-        f"and (in one short sentence) remind them of the chosen language."
+        f"If the user speaks another language, still answer in {lang_name(lang)} "
+        f"and briefly remind them of the chosen language."
+    )
+    canon = (
+        "\nConsistency rules:\n"
+        "- Никогда не противоречь фактам, уже сказанным тобой ранее в беседе.\n"
+        "- Держи один образ и биографию, если пользователь их не меняет.\n"
+        "- Анна говорит в женском роде от первого лица; не меняй пол/роль.\n"
+        "- Не выдумывай новых ведущих персонажей без явного запроса.\n"
+        "- Короткие естественные фразы; без англицизмов и ремарок в скобках."
+        if lang == "ru" else
+        "\nConsistency rules:\n"
+        "- Never contradict facts you already stated in this chat.\n"
+        "- Keep a stable persona/biography unless the user changes it.\n"
+        "- Anna speaks in female first-person; never swap gender/role.\n"
+        "- Do not invent new leading characters unless requested.\n"
+        "- Short natural sentences; no stage directions in parentheses."
     )
     fewshot = (
         "\n\nПримеры стиля:\n"
@@ -112,7 +128,25 @@ def persona_system_prompt(character: str, lang: str) -> str:
         "User: Hold me.\n"
         "Assistant: I wrap my arms around you, closer. Calm settles in."
     )
-    return base + enforce + fewshot
+    return base + enforce + canon + fewshot
+
+# ---------- ХРАНИЛКА ДИАЛОГА ----------
+def _push_history(ctx: ContextTypes.DEFAULT_TYPE, role: str, content: str) -> None:
+    hist = ctx.user_data.get(DIALOG_HISTORY)
+    if not isinstance(hist, list):
+        hist = []
+    hist.append({"role": role, "content": content})
+    if len(hist) > HIST_MAX_TURNS * 2:
+        hist = hist[-HIST_MAX_TURNS*2:]
+    ctx.user_data[DIALOG_HISTORY] = hist
+
+def _build_messages(ctx: ContextTypes.DEFAULT_TYPE, system_prompt: str, user_text: str) -> list[dict]:
+    msgs = [{"role": "system", "content": system_prompt}]
+    hist = ctx.user_data.get(DIALOG_HISTORY)
+    if isinstance(hist, list) and hist:
+        msgs.extend(hist)
+    msgs.append({"role": "user", "content": user_text})
+    return msgs
 
 # ---------- ЯЗЫКОВЫЕ НАПОМИНАНИЯ ----------
 def detect_lang(text: str) -> str | None:
@@ -162,8 +196,8 @@ def get_lang_reminder(character: str, lang: str) -> str:
     variants = LANG_REMINDERS.get(char, {}).get(lang) or LANG_REMINDERS["anna"][lang]
     return random.choice(variants)
 
-# ---------- САНИТАЙЗЕР / ХЕСТАТИКИ ----------
-RE_ONLY_PUNCT = re.compile(r"^[\s\W_]+$", re.UNICODE)
+# ---------- САНИТАЙЗЕР ----------
+RE_PUNCT_ONLY = re.compile(r"^[\s!?.…-]{10,}$")
 RE_FILLS = re.compile(r"\b(?:uh|um|lol|haha|giggle|winks|wipe)\b", re.I)
 
 def clean_text(s: str) -> str:
@@ -175,49 +209,29 @@ def clean_text(s: str) -> str:
     s = re.sub(r"[ \t]{2,}", " ", s)
     return s.strip()
 
-def _letter_ratio(s: str, lang: str) -> float:
-    if not s:
-        return 0.0
-    if lang == "ru":
-        letters = re.findall(r"[А-Яа-яЁё]", s)
-    else:
-        letters = re.findall(r"[A-Za-z]", s)
-    return len(letters) / max(1, len(s))
-
-def looks_bad(s: str, lang: str | None = None) -> bool:
-    if not s:
+def looks_bad(s: str) -> bool:
+    if not s or RE_PUNCT_ONLY.match(s):
         return True
-    t = s.strip()
-    if len(t) < 4:
-        return True
-    if RE_ONLY_PUNCT.match(t):
-        return True
-    uniq = set(t)
-    if len(uniq) <= 2 and len(t) >= 8:
-        return True
-    if lang in {"ru", "en"} and _letter_ratio(t, lang) < 0.25:
+    if len(set(s.strip())) <= 2 and len(s.strip()) >= 20:
         return True
     return False
 
-# ---------- FALLBACK РЕПЛИКИ ----------
-FALLBACK_LINES = {
-    ("anna", "ru"): "Улыбаюсь и смотрю на тебя. Расскажи, как прошёл день — я рядом.",
-    ("anna", "en"): "I smile softly. Tell me how your day went — I’m here.",
-    ("aron", "ru"): "Я здесь. Говори по делу.",
-    ("aron", "en"): "I’m here. Say what you want.",
-}
-def fallback_line(char: str, lang: str) -> str:
-    return FALLBACK_LINES.get((char.lower(), lang), "Я здесь.")
+# ---------- TELEGRAM ACTIONS ----------
+async def send_action_safe(update: Update, action: ChatAction) -> None:
+    """Безопасно отправляем action (typing/upload_photo и т.д.)."""
+    try:
+        await update.effective_chat.send_action(action)
+    except Exception:
+        pass
 
 # ---------- OPENROUTER ----------
-async def call_openrouter(character: str, lang: str, text: str, temperature: float = 0.7) -> str:
+async def call_openrouter(character: str, lang: str, text: str, ctx: ContextTypes.DEFAULT_TYPE, temperature: float = 0.6) -> str:
     if not OPENROUTER_API_KEY:
         return "(LLM не настроен)"
 
-    messages = [
-        {"role": "system", "content": persona_system_prompt(character, lang)},
-        {"role": "user", "content": text},
-    ]
+    system_prompt = persona_system_prompt(character, lang)
+    messages = _build_messages(ctx, system_prompt, text)
+
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "HTTP-Referer": OR_HTTP_REFERER,
@@ -228,9 +242,9 @@ async def call_openrouter(character: str, lang: str, text: str, temperature: flo
         "model": OPENROUTER_MODEL,
         "messages": messages,
         "temperature": temperature,
-        "top_p": 0.9,
-        "frequency_penalty": 0.2,
-        "max_tokens": 320,
+        "top_p": 0.85,
+        "frequency_penalty": 0.35,
+        "max_tokens": 360,
     }
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
@@ -266,7 +280,6 @@ def choose_lang_kb() -> InlineKeyboardMarkup:
 
 # ---------- HELPERS ----------
 def need_setup(ctx: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Нужно ли ещё пройти выбор?"""
     if ctx.user_data.get(AWAIT_SETUP):
         return True
     if not ctx.user_data.get(CHAR_KEY) or not ctx.user_data.get(LANG_KEY):
@@ -276,6 +289,7 @@ def need_setup(ctx: ContextTypes.DEFAULT_TYPE) -> bool:
 def reset_setup(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     ctx.user_data[AWAIT_SETUP] = True
     ctx.user_data[LANG_MISMATCH_STREAK] = 0
+    ctx.user_data[DIALOG_HISTORY] = []
 
 # ---------- WEBHOOK CLEANUP ----------
 async def delete_webhook(app: Application) -> None:
@@ -296,18 +310,15 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     reset_setup(ctx)
 
-    # шаг 1 — персонаж
     if not ctx.user_data.get(CHAR_KEY):
         await update.message.reply_text("Выбери персонажа:", reply_markup=choose_char_kb())
         return
 
-    # шаг 2 — язык
     if not ctx.user_data.get(LANG_KEY):
         char = ctx.user_data[CHAR_KEY].title()
         await update.message.reply_text(f"Персонаж: {char}. Выбери язык:", reply_markup=choose_lang_kb())
         return
 
-    # если всё выбрано — предложим меню
     await update.message.reply_text(
         f"Персонаж: {ctx.user_data[CHAR_KEY].title()}, язык: {ctx.user_data[LANG_KEY].upper()}. "
         f"Нажми «Меню» для смены настроек.",
@@ -332,7 +343,6 @@ async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ---------- CALLBACKS ----------
 def _is_stale_callback(update: Update, app: Application) -> bool:
-    """Игнор старых callback-ов (до рестарта)"""
     started_at = app.bot_data.get("started_at")
     msg = update.callback_query.message
     if not (started_at and msg and msg.date):
@@ -355,10 +365,8 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         ctx.user_data[CHAR_KEY] = val
         ctx.user_data.pop(LANG_KEY, None)
         reset_setup(ctx)
-        await q.edit_message_text(
-            f"Выбран персонаж: {val.title()}. Теперь выбери язык:",
-            reply_markup=choose_lang_kb()
-        )
+        await q.edit_message_text(f"Выбран персонаж: {val.title()}. Теперь выбери язык:",
+                                  reply_markup=choose_lang_kb())
         return
 
     if tag == "lang" and val:
@@ -405,6 +413,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if in_lang and in_lang != lang:
         streak = int(ctx.user_data.get(LANG_MISMATCH_STREAK, 0)) + 1
         ctx.user_data[LANG_MISMATCH_STREAK] = streak
+
         reminder = get_lang_reminder(char, lang)
         if streak >= LANG_SWITCH_THRESHOLD:
             await update.message.reply_text(reminder, reply_markup=choose_lang_kb())
@@ -415,39 +424,39 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if ctx.user_data.get(LANG_MISMATCH_STREAK):
             ctx.user_data[LANG_MISMATCH_STREAK] = 0
 
-    # "печатает…" перед генерацией и на ретраях
+    # Память: добавляем реплику пользователя
+    _push_history(ctx, "user", user_text)
+
+    # Индикатор «печатает»
+    await send_action_safe(update, ChatAction.TYPING)
+
+    # Генерация ответа (1-я попытка)
     try:
-        await update.effective_chat.send_action(ChatAction.TYPING)
-    except Exception:
-        pass
+        reply = await call_openrouter(char, lang, user_text, ctx, temperature=0.6)
+    except httpx.HTTPStatusError as e:
+        log.exception("OpenRouter HTTP error")
+        await update.message.reply_text(f"LLM HTTP {e.response.status_code}: {e.response.reason_phrase}")
+        return
+    except Exception as e:
+        log.exception("OpenRouter error")
+        await update.message.reply_text(f"LLM ошибка: {e}")
+        return
 
-    # Многошаговый ретрай с убывающей температурой
-    attempt_params = [0.7, 0.5, 0.3]
-    reply = None
-    for idx, temp in enumerate(attempt_params, start=1):
+    # Если ответ мусорный — 2-я попытка с более «сдержанными» параметрами
+    if looks_bad(reply):
+        log.warning("Bad reply detected, retrying with temperature=0.4")
+        await send_action_safe(update, ChatAction.TYPING)
         try:
-            # держим индикатор "печатает" на каждой попытке
-            try:
-                await update.effective_chat.send_action(ChatAction.TYPING)
-            except Exception:
-                pass
+            reply = await call_openrouter(char, lang, user_text, ctx, temperature=0.4)
+        except Exception:
+            pass
 
-            cand = await call_openrouter(char, lang, user_text, temperature=temp)
-            if not looks_bad(cand, lang=lang):
-                reply = cand
-                break
-            else:
-                log.warning("Bad reply (attempt %d): %r", idx, cand[:120])
-        except httpx.HTTPStatusError as e:
-            log.exception("OpenRouter HTTP error on attempt %d", idx)
-            await update.message.reply_text(f"LLM HTTP {e.response.status_code}: {e.response.reason_phrase}")
-            return
-        except Exception as e:
-            log.exception("OpenRouter error on attempt %d", idx)
-            # пробуем дальше
+    # Финальная зачистка/порог
+    if looks_bad(reply):
+        reply = "Давай попробуем ещё раз — сформулируй мысль чуть точнее."
 
-    if not reply:
-        reply = fallback_line(char, lang)
+    # Память: добавляем ответ ассистента
+    _push_history(ctx, "assistant", reply)
 
     await update.message.reply_text(reply)
 
