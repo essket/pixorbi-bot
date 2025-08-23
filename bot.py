@@ -4,6 +4,7 @@ import os
 import logging
 import time
 import re
+import random
 import httpx
 from datetime import datetime, timezone
 
@@ -96,6 +97,55 @@ def persona_system_prompt(character: str, lang: str) -> str:
         "Assistant: I wrap my arms around you, closer. Calm settles in."
     )
     return base + enforce + fewshot
+
+# ---------- ЯЗЫКОВЫЕ НАПОМИНАНИЯ И ДЕТЕКТ ----------
+def detect_lang(text: str) -> str | None:
+    """Простая эвристика: только кириллица → ru, только латиница → en, иначе None."""
+    has_cyr = bool(re.search(r"[А-Яа-яЁё]", text))
+    has_lat = bool(re.search(r"[A-Za-z]", text))
+    if has_cyr and not has_lat:
+        return "ru"
+    if has_lat and not has_cyr:
+        return "en"
+    return None
+
+LANG_REMINDERS = {
+    "anna": {
+        "ru": [
+            "Давай по‑русски, пожалуйста 😊",
+            "Я сейчас говорю только по‑русски. Переключишься?",
+            "Без английского, ладно? На русском будет легче 💫",
+            "Понимаю тебя, но отвечаю только на русском.",
+        ],
+        "en": [
+            "Let’s keep it in English, please 💫",
+            "I’m answering only in English now. Can you switch?",
+            "Sorry, English only for me right now.",
+            "Got it — but I’ll reply in English only.",
+        ],
+    },
+    "aron": {
+        "ru": [
+            "Пиши по‑русски. Быстро.",
+            "Русский здесь. Переключись.",
+            "По‑русски давай. Так проще.",
+            "Русский язык. Не усложняй.",
+        ],
+        "en": [
+            "English. Keep it simple.",
+            "Switch to English. Now.",
+            "Use English — no fuss.",
+            "English only. Stick to it.",
+        ],
+    },
+}
+
+def get_lang_reminder(character: str, lang: str) -> str:
+    char = character.lower()
+    if char not in LANG_REMINDERS:
+        char = "anna"
+    variants = LANG_REMINDERS.get(char, {}).get(lang) or LANG_REMINDERS["anna"][lang]
+    return random.choice(variants)
 
 # ---------- САНИТАЙЗЕР ----------
 RE_PUNCT_ONLY = re.compile(r"^[\s!?.…-]{10,}$")
@@ -268,6 +318,13 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     user_text = update.message.text.strip()
+
+    # Если язык сообщения не совпадает с выбранным — даём «характерное» напоминание + кнопки смены языка
+    in_lang = detect_lang(user_text)
+    if in_lang and in_lang != lang:
+        reminder = get_lang_reminder(char, lang)
+        await update.message.reply_text(reminder, reply_markup=choose_lang_kb())
+        return
 
     # 1-я попытка
     try:
