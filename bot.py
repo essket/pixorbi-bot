@@ -4,6 +4,7 @@ import os
 import logging
 import httpx
 import time
+import re
 
 from telegram import Update
 from telegram.error import Conflict
@@ -45,6 +46,7 @@ RUNPOD_RUNSYNC_URL = (
 
 # OpenRouter (LLM для диалогов)
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+# если в ENV не задана модель, используем lumimaid-70b (проверенная доступность)
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "neversleep/llama-3-lumimaid-70b")
 OR_HTTP_REFERER = os.getenv("OR_HTTP_REFERER", "https://pixorbibot.onrender.com")
 OR_X_TITLE = os.getenv("OR_X_TITLE", "PixorbiDream")
@@ -85,7 +87,6 @@ def get_persona(character: str) -> str:
     )
     return base + examples
 
-
 # ---------- ТЕХНИКА ----------
 async def delete_webhook(app: Application) -> None:
     try:
@@ -116,35 +117,38 @@ async def call_runpod(user_id: int, character: str, text: str) -> str:
     except httpx.HTTPStatusError as e:
         log.exception("RunPod HTTP error")
         msg = f"RunPod HTTP {e.response.status_code} {e.response.reason_phrase}"
-        return msg if DEBUG_TO_CHAT else f"Упс… ошибка сервера."
+        return msg if DEBUG_TO_CHAT else "Упс… ошибка сервера."
     except Exception as e:
         log.exception("RunPod error")
         return str(e) if DEBUG_TO_CHAT else "Упс… ошибка сервера."
 
 # ----- OpenRouter (LLM) -----
-import re
-
 def _sanitize(text: str) -> str:
     if not text:
         return text
-    # уберём случайные латинские вставки вроде 'uh', 'wipe', 'lol' между русскими словами
+    # уберём случайные латинские вставки вроде 'uh', 'wipe', 'lol'
     text = re.sub(r'\b(?:uh|um|lol|haha|giggle|winks|wipe)\b', '', text, flags=re.IGNORECASE)
     # двойные пробелы → один
     text = re.sub(r'[ \t]{2,}', ' ', text)
-    # странные пробелы перед пунктуацией
+    # пробелы перед пунктуацией
     text = re.sub(r'\s+([,.!?;:])', r'\1', text)
-    # нормализуем длинные троеточия
+    # длинные многоточия
     text = re.sub(r'\.{4,}', '...', text)
     return text.strip()
 
-async def call_openrouter(user_id: int, character: str, text: str) -> str:
+async def call_openrouter(user_id: int, character: str, text: str) -> tuple[str | None, str | None]:
+    """
+    Возвращает (reply, err):
+      - reply: текст ответа модели или None
+      - err:   текст ошибки (для фоллбэка) или None
+    """
     if not OPENROUTER_API_KEY:
-        raise RuntimeError("OPENROUTER_API_KEY is missing")
+        return None, "no_api_key"
 
     system_prompt = get_persona(character)
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": text},
+        {"role": "user",   "content": text},
     ]
 
     headers = {
@@ -156,11 +160,11 @@ async def call_openrouter(user_id: int, character: str, text: str) -> str:
     payload = {
         "model": OPENROUTER_MODEL,
         "messages": messages,
-        "temperature": 0.6,        # было 0.8
+        "temperature": 0.6,
         "top_p": 0.9,
-        "frequency_penalty": 0.2,  # чуть меньше повторов
+        "frequency_penalty": 0.2,
         "presence_penalty": 0.0,
-        "max_tokens": 320,         # немного больше воздуха ответу
+        "max_tokens": 320,
     }
 
     try:
@@ -175,21 +179,27 @@ async def call_openrouter(user_id: int, character: str, text: str) -> str:
 
         choice = (data.get("choices") or [{}])[0]
         content = (choice.get("message") or {}).get("content") or ""
-        return _sanitize(content) if content else f"{character.title()}: (пустой ответ модели)"
+        reply = _sanitize(content) if content else f"{character.title()}: (пустой ответ модели)"
+        return reply, None
+
     except httpx.HTTPStatusError as e:
-        log.exception("OpenRouter HTTP error")
+        # короткий и информативный текст для чата/логов
         code = e.response.status_code
-        reason = e.response.reason_phrase
-        detail = ""
+        reason = e.response.reason_phrase or "HTTP error"
+        short = f"http_{code} {reason}"
         try:
-            detail = e.response.text[:300]
+            detail = e.response.json()
+            # если OpenRouter вернул полезное сообщение — добавим
+            if isinstance(detail, dict) and "error" in detail:
+                short += f": {detail['error']}"
         except Exception:
             pass
-        return f"LLM ошибка: {code} {reason}\n{detail}"
+        log.exception("OpenRouter HTTP error")
+        return None, short
+
     except Exception as e:
         log.exception("OpenRouter error")
-        return f"LLM ошибка: {e}"
-
+        return None, str(e)
 
 # ---------- УТИЛИТЫ ----------
 def get_user_char(ctx: ContextTypes.DEFAULT_TYPE) -> str:
@@ -242,7 +252,6 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         # Диагностика фоллбэка
         if DEBUG_TO_CHAT and or_err:
             await update.message.reply_text(f"[LLM fallback] {or_err}")
-
         # RunPod или заглушка
         reply = await call_runpod(user_id=user_id, character=character, text=text)
 
@@ -278,6 +287,3 @@ if __name__ == "__main__":
         except Conflict:
             log.warning("409 Conflict (другой инстанс бота). Жду 5 сек и пробую снова…")
             time.sleep(5)
-
-
-
