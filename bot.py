@@ -31,14 +31,21 @@ OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "neversleep/llama-3-lumimaid-70
 OR_HTTP_REFERER = os.getenv("OR_HTTP_REFERER", "https://pixorbibot.onrender.com")
 OR_X_TITLE = os.getenv("OR_X_TITLE", "PixorbiDream")
 
+# Порог, после которого показываем кнопки смены языка (подсчёт подряд идущих «не тем языком»)
+try:
+    LANG_SWITCH_THRESHOLD = max(1, int(os.getenv("LANG_SWITCH_THRESHOLD", "3")))
+except Exception:
+    LANG_SWITCH_THRESHOLD = 3
+
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN is required (Render → Environment)")
 
 # ---------- КОНСТАНТЫ КЛЮЧЕЙ ----------
 CHAR_KEY = "char"
-LANG_KEY = "lang"       # 'ru' | 'en'
+LANG_KEY = "lang"              # 'ru' | 'en'
 STARTED_KEY = "started"
-LAST_CB_TS = "last_cb_ts"  # защита от «залежавшихся» callback-ов
+LAST_CB_TS = "last_cb_ts"      # защита от «залежавшихся» callback-ов
+LANG_MISMATCH_STREAK = "lang_mismatch_streak"  # счётчик подряд идущих сообщений не на выбранном языке
 
 # ---------- ПЕРСОНАЖИ ----------
 CHAR_PERSONAS = {
@@ -236,6 +243,9 @@ async def delete_webhook(app: Application) -> None:
 # ---------- КОМАНДЫ ----------
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     ctx.user_data[STARTED_KEY] = True
+    # При старте сбрасываем счётчик «не тот язык»
+    ctx.user_data[LANG_MISMATCH_STREAK] = 0
+
     char = ctx.user_data.get(CHAR_KEY)
     lang = ctx.user_data.get(LANG_KEY)
 
@@ -287,13 +297,17 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     if tag == "char" and val:
         ctx.user_data[CHAR_KEY] = val
-        ctx.user_data.pop(LANG_KEY, None)   # сбросим язык — просим выбрать заново
+        # смена персонажа — просим выбрать язык заново и сбрасываем счётчик
+        ctx.user_data.pop(LANG_KEY, None)
+        ctx.user_data[LANG_MISMATCH_STREAK] = 0
         await q.edit_message_text(f"Выбран персонаж: {val.title()}. Теперь выбери язык:",
                                   reply_markup=choose_lang_kb())
         return
 
     if tag == "lang" and val:
         ctx.user_data[LANG_KEY] = val
+        # смена языка — сбрасываем счётчик
+        ctx.user_data[LANG_MISMATCH_STREAK] = 0
         await q.edit_message_text(f"Язык установлен: {val.upper()}. Можно писать сообщения!",
                                   reply_markup=main_menu_kb())
         return
@@ -319,12 +333,25 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     user_text = update.message.text.strip()
 
-    # Если язык сообщения не совпадает с выбранным — даём «характерное» напоминание + кнопки смены языка
+    # Язык входа vs выбранный язык
     in_lang = detect_lang(user_text)
     if in_lang and in_lang != lang:
+        # накапливаем подряд идущие «не тем языком»
+        streak = int(ctx.user_data.get(LANG_MISMATCH_STREAK, 0)) + 1
+        ctx.user_data[LANG_MISMATCH_STREAK] = streak
+
         reminder = get_lang_reminder(char, lang)
-        await update.message.reply_text(reminder, reply_markup=choose_lang_kb())
+        if streak >= LANG_SWITCH_THRESHOLD:
+            # после N раз — даём кнопки смены языка
+            await update.message.reply_text(reminder, reply_markup=choose_lang_kb())
+        else:
+            # до порога — только мягкое/характерное напоминание
+            await update.message.reply_text(reminder)
         return
+    else:
+        # вернулся на правильный язык — обнуляем счётчик
+        if ctx.user_data.get(LANG_MISMATCH_STREAK):
+            ctx.user_data[LANG_MISMATCH_STREAK] = 0
 
     # 1-я попытка
     try:
