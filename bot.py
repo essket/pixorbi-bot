@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup
 )
+from telegram.constants import ChatAction
 from telegram.error import Conflict
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
@@ -358,7 +359,6 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     # Пока не пройдён выбор — не общаемся
     if need_setup(ctx):
-        # подсказываем, чего не хватает
         if not ctx.user_data.get(CHAR_KEY):
             await update.message.reply_text("Сначала выбери персонажа:", reply_markup=choose_char_kb())
         elif not ctx.user_data.get(LANG_KEY):
@@ -387,7 +387,13 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if ctx.user_data.get(LANG_MISMATCH_STREAK):
             ctx.user_data[LANG_MISMATCH_STREAK] = 0
 
-    # Генерация ответа
+    # 👇 показываем статус "печатает" перед генерацией
+    try:
+        await update.effective_chat.send_action(ChatAction.TYPING)
+    except Exception:
+        pass
+
+    # Генерация ответа (1-я попытка)
     try:
         reply = await call_openrouter(char, lang, user_text, temperature=0.7)
     except httpx.HTTPStatusError as e:
@@ -399,13 +405,20 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"LLM ошибка: {e}")
         return
 
+    # если ответ мусорный — 2-я попытка с более «сдержанными» параметрами
     if looks_bad(reply):
         log.warning("Bad reply detected, retrying with temperature=0.4")
         try:
+            # 👇 снова показываем "печатает" на ретрае
+            try:
+                await update.effective_chat.send_action(ChatAction.TYPING)
+            except Exception:
+                pass
             reply = await call_openrouter(char, lang, user_text, temperature=0.4)
         except Exception:
             pass
 
+    # финальная зачистка/порог
     if looks_bad(reply):
         reply = "Давай попробуем ещё раз — сформулируй мысль чуть точнее."
 
