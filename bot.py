@@ -31,7 +31,15 @@ OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "neversleep/llama-3-lumimaid-70
 OR_HTTP_REFERER = os.getenv("OR_HTTP_REFERER", "https://pixorbibot.onrender.com")
 OR_X_TITLE = os.getenv("OR_X_TITLE", "PixorbiDream")
 
-# Порог, после которого показываем кнопки смены языка (подсчёт подряд идущих «не тем языком»)
+def _as_bool(v: str | None, default=False) -> bool:
+    if v is None:
+        return default
+    return v.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+# Если TRUE — при каждом /start принудительно просим выбрать персонажа и язык заново
+FORCE_RESELECT_ON_START = _as_bool(os.getenv("FORCE_RESELECT_ON_START"), True)
+
+# Порог, после которого показываем кнопки смены языка
 try:
     LANG_SWITCH_THRESHOLD = max(1, int(os.getenv("LANG_SWITCH_THRESHOLD", "3")))
 except Exception:
@@ -40,12 +48,12 @@ except Exception:
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN is required (Render → Environment)")
 
-# ---------- КОНСТАНТЫ КЛЮЧЕЙ ----------
+# ---------- КЛЮЧИ ----------
 CHAR_KEY = "char"
-LANG_KEY = "lang"              # 'ru' | 'en'
+LANG_KEY = "lang"                  # 'ru' | 'en'
 STARTED_KEY = "started"
-LAST_CB_TS = "last_cb_ts"      # защита от «залежавшихся» callback-ов
-LANG_MISMATCH_STREAK = "lang_mismatch_streak"  # счётчик подряд идущих сообщений не на выбранном языке
+AWAIT_SETUP = "await_setup"        # пока не выбран(ы) персонаж/язык — True
+LANG_MISMATCH_STREAK = "lang_mismatch_streak"
 
 # ---------- ПЕРСОНАЖИ ----------
 CHAR_PERSONAS = {
@@ -66,12 +74,12 @@ CHAR_PERSONAS = {
     "aron": {
         "ru": (
             "Ты — Арон, взрослый воин. Отвечай ТОЛЬКО на русском. "
-            "Тон прямой, грубоватый, уверенный, но без cruelty. "
-            "Допустимы лёгкие романтические/эротические моменты для взрослых; стиль сдержанно-мужской, без пошлятины."
+            "Тон прямой, грубоватый, уверенный, но без жестокости. "
+            "Допустимы лёгкие романтические/эротические моменты для взрослых; стиль сдержанно‑мужской, без пошлятины."
         ),
         "en": (
             "You are Aron, a seasoned warrior. Reply ONLY in English. "
-            "Blunt, rough-edged, confident tone (not cruel). "
+            "Blunt, rough‑edged, confident tone (not cruel). "
             "Light adult romance allowed; keep it masculine and restrained, never vulgar."
         ),
     },
@@ -105,9 +113,8 @@ def persona_system_prompt(character: str, lang: str) -> str:
     )
     return base + enforce + fewshot
 
-# ---------- ЯЗЫКОВЫЕ НАПОМИНАНИЯ И ДЕТЕКТ ----------
+# ---------- ЯЗЫКОВЫЕ НАПОМИНАНИЯ ----------
 def detect_lang(text: str) -> str | None:
-    """Простая эвристика: только кириллица → ru, только латиница → en, иначе None."""
     has_cyr = bool(re.search(r"[А-Яа-яЁё]", text))
     has_lat = bool(re.search(r"[A-Za-z]", text))
     if has_cyr and not has_lat:
@@ -170,7 +177,6 @@ def clean_text(s: str) -> str:
 def looks_bad(s: str) -> bool:
     if not s or RE_PUNCT_ONLY.match(s):
         return True
-    # слишком однообразные символы
     if len(set(s.strip())) <= 2 and len(s.strip()) >= 20:
         return True
     return False
@@ -208,11 +214,10 @@ async def call_openrouter(character: str, lang: str, text: str, temperature: flo
     choice = (data.get("choices") or [{}])[0]
     content = (choice.get("message") or {}).get("content") or ""
     content = clean_text(content)
-    # Ограничим подряд идущие одинаковые знаки (например, «!!!!»)
     content = re.sub(r"([!?…])\1{3,}", r"\1\1", content)
     return content or "(пустой ответ)"
 
-# ---------- ВСПОМОГАТЕЛЬНОЕ ----------
+# ---------- КНОПКИ ----------
 def main_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Сменить персонажа", callback_data="menu|change_char")],
@@ -231,11 +236,24 @@ def choose_lang_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("English 🇬🇧", callback_data="lang|en")],
     ])
 
+# ---------- HELPERS ----------
+def need_setup(ctx: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Нужно ли ещё пройти выбор?"""
+    if ctx.user_data.get(AWAIT_SETUP):
+        return True
+    if not ctx.user_data.get(CHAR_KEY) or not ctx.user_data.get(LANG_KEY):
+        return True
+    return False
+
+def reset_setup(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    ctx.user_data[AWAIT_SETUP] = True
+    ctx.user_data[LANG_MISMATCH_STREAK] = 0
+
+# ---------- WEBHOOK CLEANUP ----------
 async def delete_webhook(app: Application) -> None:
     try:
         await app.bot.delete_webhook(drop_pending_updates=True)
         log.info("Webhook deleted (drop_pending_updates=True).")
-        # отметим «время старта» — чтобы игнорить старые callback-и
         app.bot_data["started_at"] = datetime.now(timezone.utc)
     except Exception as e:
         log.warning("delete_webhook failed: %s", e)
@@ -243,21 +261,28 @@ async def delete_webhook(app: Application) -> None:
 # ---------- КОМАНДЫ ----------
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     ctx.user_data[STARTED_KEY] = True
-    # При старте сбрасываем счётчик «не тот язык»
-    ctx.user_data[LANG_MISMATCH_STREAK] = 0
 
-    char = ctx.user_data.get(CHAR_KEY)
-    lang = ctx.user_data.get(LANG_KEY)
+    if FORCE_RESELECT_ON_START:
+        ctx.user_data.pop(CHAR_KEY, None)
+        ctx.user_data.pop(LANG_KEY, None)
 
-    if not char:
+    reset_setup(ctx)
+
+    # шаг 1 — персонаж
+    if not ctx.user_data.get(CHAR_KEY):
         await update.message.reply_text("Выбери персонажа:", reply_markup=choose_char_kb())
         return
-    if not lang:
-        await update.message.reply_text(f"Персонаж: {char.title()}. Выбери язык:", reply_markup=choose_lang_kb())
+
+    # шаг 2 — язык
+    if not ctx.user_data.get(LANG_KEY):
+        char = ctx.user_data[CHAR_KEY].title()
+        await update.message.reply_text(f"Персонаж: {char}. Выбери язык:", reply_markup=choose_lang_kb())
         return
 
+    # если всё выбрано (редкий случай) — предложим меню, но до кликов всё равно не отвечаем
     await update.message.reply_text(
-        f"Персонаж: {char.title()}, язык: {lang.upper()}. Можешь писать сообщение.",
+        f"Персонаж: {ctx.user_data[CHAR_KEY].title()}, язык: {ctx.user_data[LANG_KEY].upper()}. "
+        f"Нажми «Меню» для смены настроек.",
         reply_markup=main_menu_kb()
     )
 
@@ -272,21 +297,23 @@ async def cmd_lang(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     cur = ctx.user_data.get(LANG_KEY, "не выбран")
     await update.message.reply_text(f"Текущий язык: {cur}. Сменить?", reply_markup=choose_lang_kb())
 
+async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    ctx.user_data.clear()
+    reset_setup(ctx)
+    await update.message.reply_text("Сброс настроек. Выбери персонажа:", reply_markup=choose_char_kb())
+
 # ---------- CALLBACKS ----------
 def _is_stale_callback(update: Update, app: Application) -> bool:
-    """Игнорим «залежавшиеся» callback-и (до старта бота)."""
     started_at = app.bot_data.get("started_at")
     msg = update.callback_query.message
     if not (started_at and msg and msg.date):
         return False
-    # Телега отдаёт msg.date в UTC
     return msg.date.replace(tzinfo=timezone.utc) < started_at
 
 async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     await q.answer()
 
-    # защита от старых callback-ов после деплоя
     if _is_stale_callback(update, ctx.application):
         log.info("Ignore stale callback: %s", q.data)
         return
@@ -297,26 +324,30 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     if tag == "char" and val:
         ctx.user_data[CHAR_KEY] = val
-        # смена персонажа — просим выбрать язык заново и сбрасываем счётчик
         ctx.user_data.pop(LANG_KEY, None)
-        ctx.user_data[LANG_MISMATCH_STREAK] = 0
+        reset_setup(ctx)
         await q.edit_message_text(f"Выбран персонаж: {val.title()}. Теперь выбери язык:",
                                   reply_markup=choose_lang_kb())
         return
 
     if tag == "lang" and val:
         ctx.user_data[LANG_KEY] = val
-        # смена языка — сбрасываем счётчик
+        # Настройка завершена
+        ctx.user_data[AWAIT_SETUP] = False
         ctx.user_data[LANG_MISMATCH_STREAK] = 0
-        await q.edit_message_text(f"Язык установлен: {val.upper()}. Можно писать сообщения!",
-                                  reply_markup=main_menu_kb())
+        await q.edit_message_text(
+            f"Язык установлен: {val.upper()}. Можно писать сообщения!",
+            reply_markup=main_menu_kb()
+        )
         return
 
     if tag == "menu" and val == "change_char":
+        reset_setup(ctx)
         await q.edit_message_text("Выбери персонажа:", reply_markup=choose_char_kb())
         return
 
     if tag == "menu" and val == "change_lang":
+        reset_setup(ctx)
         await q.edit_message_text("Выбери язык:", reply_markup=choose_lang_kb())
         return
 
@@ -325,35 +356,38 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.message.text:
         return
 
-    char = ctx.user_data.get(CHAR_KEY)
-    lang = ctx.user_data.get(LANG_KEY)
-    if not char or not lang:
-        await update.message.reply_text("Сначала выбери персонажа и язык: /start")
+    # Пока не пройдён выбор — не общаемся
+    if need_setup(ctx):
+        # подсказываем, чего не хватает
+        if not ctx.user_data.get(CHAR_KEY):
+            await update.message.reply_text("Сначала выбери персонажа:", reply_markup=choose_char_kb())
+        elif not ctx.user_data.get(LANG_KEY):
+            await update.message.reply_text("Теперь выбери язык:", reply_markup=choose_lang_kb())
+        else:
+            await update.message.reply_text("Нажми кнопки настройки выше, затем продолжим.")
         return
 
+    char = ctx.user_data.get(CHAR_KEY)
+    lang = ctx.user_data.get(LANG_KEY)
     user_text = update.message.text.strip()
 
-    # Язык входа vs выбранный язык
+    # Контроль языка пользователя
     in_lang = detect_lang(user_text)
     if in_lang and in_lang != lang:
-        # накапливаем подряд идущие «не тем языком»
         streak = int(ctx.user_data.get(LANG_MISMATCH_STREAK, 0)) + 1
         ctx.user_data[LANG_MISMATCH_STREAK] = streak
 
         reminder = get_lang_reminder(char, lang)
         if streak >= LANG_SWITCH_THRESHOLD:
-            # после N раз — даём кнопки смены языка
             await update.message.reply_text(reminder, reply_markup=choose_lang_kb())
         else:
-            # до порога — только мягкое/характерное напоминание
             await update.message.reply_text(reminder)
         return
     else:
-        # вернулся на правильный язык — обнуляем счётчик
         if ctx.user_data.get(LANG_MISMATCH_STREAK):
             ctx.user_data[LANG_MISMATCH_STREAK] = 0
 
-    # 1-я попытка
+    # Генерация ответа
     try:
         reply = await call_openrouter(char, lang, user_text, temperature=0.7)
     except httpx.HTTPStatusError as e:
@@ -365,7 +399,6 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"LLM ошибка: {e}")
         return
 
-    # если ответ мусорный — 2-я попытка с более «сдержанными» параметрами
     if looks_bad(reply):
         log.warning("Bad reply detected, retrying with temperature=0.4")
         try:
@@ -373,7 +406,6 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         except Exception:
             pass
 
-    # финальная зачистка/порог
     if looks_bad(reply):
         reply = "Давай попробуем ещё раз — сформулируй мысль чуть точнее."
 
@@ -403,6 +435,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("menu", cmd_menu))
     app.add_handler(CommandHandler("char", cmd_char))
     app.add_handler(CommandHandler("lang", cmd_lang))
+    app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_error_handler(on_error)
