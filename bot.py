@@ -37,10 +37,10 @@ def _as_bool(v: str | None, default=False) -> bool:
         return default
     return v.strip().lower() in {"1", "true", "yes", "y", "on"}
 
-# Если TRUE — при каждом /start принудительно просим выбрать персонажа и язык заново
+# При каждом /start заново просить выбрать персонажа/язык?
 FORCE_RESELECT_ON_START = _as_bool(os.getenv("FORCE_RESELECT_ON_START"), True)
 
-# Порог, после которого показываем кнопки смены языка
+# После скольких «не тем языком» показывать кнопки смены языка
 try:
     LANG_SWITCH_THRESHOLD = max(1, int(os.getenv("LANG_SWITCH_THRESHOLD", "3")))
 except Exception:
@@ -162,8 +162,8 @@ def get_lang_reminder(character: str, lang: str) -> str:
     variants = LANG_REMINDERS.get(char, {}).get(lang) or LANG_REMINDERS["anna"][lang]
     return random.choice(variants)
 
-# ---------- САНИТАЙЗЕР ----------
-RE_PUNCT_ONLY = re.compile(r"^[\s!?.…-]{10,}$")
+# ---------- САНИТАЙЗЕР / ХЕСТАТИКИ ----------
+RE_ONLY_PUNCT = re.compile(r"^[\s\W_]+$", re.UNICODE)
 RE_FILLS = re.compile(r"\b(?:uh|um|lol|haha|giggle|winks|wipe)\b", re.I)
 
 def clean_text(s: str) -> str:
@@ -175,12 +175,39 @@ def clean_text(s: str) -> str:
     s = re.sub(r"[ \t]{2,}", " ", s)
     return s.strip()
 
-def looks_bad(s: str) -> bool:
-    if not s or RE_PUNCT_ONLY.match(s):
+def _letter_ratio(s: str, lang: str) -> float:
+    if not s:
+        return 0.0
+    if lang == "ru":
+        letters = re.findall(r"[А-Яа-яЁё]", s)
+    else:
+        letters = re.findall(r"[A-Za-z]", s)
+    return len(letters) / max(1, len(s))
+
+def looks_bad(s: str, lang: str | None = None) -> bool:
+    if not s:
         return True
-    if len(set(s.strip())) <= 2 and len(s.strip()) >= 20:
+    t = s.strip()
+    if len(t) < 4:
+        return True
+    if RE_ONLY_PUNCT.match(t):
+        return True
+    uniq = set(t)
+    if len(uniq) <= 2 and len(t) >= 8:
+        return True
+    if lang in {"ru", "en"} and _letter_ratio(t, lang) < 0.25:
         return True
     return False
+
+# ---------- FALLBACK РЕПЛИКИ ----------
+FALLBACK_LINES = {
+    ("anna", "ru"): "Улыбаюсь и смотрю на тебя. Расскажи, как прошёл день — я рядом.",
+    ("anna", "en"): "I smile softly. Tell me how your day went — I’m here.",
+    ("aron", "ru"): "Я здесь. Говори по делу.",
+    ("aron", "en"): "I’m here. Say what you want.",
+}
+def fallback_line(char: str, lang: str) -> str:
+    return FALLBACK_LINES.get((char.lower(), lang), "Я здесь.")
 
 # ---------- OPENROUTER ----------
 async def call_openrouter(character: str, lang: str, text: str, temperature: float = 0.7) -> str:
@@ -280,7 +307,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"Персонаж: {char}. Выбери язык:", reply_markup=choose_lang_kb())
         return
 
-    # если всё выбрано (редкий случай) — предложим меню, но до кликов всё равно не отвечаем
+    # если всё выбрано — предложим меню
     await update.message.reply_text(
         f"Персонаж: {ctx.user_data[CHAR_KEY].title()}, язык: {ctx.user_data[LANG_KEY].upper()}. "
         f"Нажми «Меню» для смены настроек.",
@@ -305,6 +332,7 @@ async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ---------- CALLBACKS ----------
 def _is_stale_callback(update: Update, app: Application) -> bool:
+    """Игнор старых callback-ов (до рестарта)"""
     started_at = app.bot_data.get("started_at")
     msg = update.callback_query.message
     if not (started_at and msg and msg.date):
@@ -327,13 +355,14 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         ctx.user_data[CHAR_KEY] = val
         ctx.user_data.pop(LANG_KEY, None)
         reset_setup(ctx)
-        await q.edit_message_text(f"Выбран персонаж: {val.title()}. Теперь выбери язык:",
-                                  reply_markup=choose_lang_kb())
+        await q.edit_message_text(
+            f"Выбран персонаж: {val.title()}. Теперь выбери язык:",
+            reply_markup=choose_lang_kb()
+        )
         return
 
     if tag == "lang" and val:
         ctx.user_data[LANG_KEY] = val
-        # Настройка завершена
         ctx.user_data[AWAIT_SETUP] = False
         ctx.user_data[LANG_MISMATCH_STREAK] = 0
         await q.edit_message_text(
@@ -376,7 +405,6 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if in_lang and in_lang != lang:
         streak = int(ctx.user_data.get(LANG_MISMATCH_STREAK, 0)) + 1
         ctx.user_data[LANG_MISMATCH_STREAK] = streak
-
         reminder = get_lang_reminder(char, lang)
         if streak >= LANG_SWITCH_THRESHOLD:
             await update.message.reply_text(reminder, reply_markup=choose_lang_kb())
@@ -387,40 +415,39 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if ctx.user_data.get(LANG_MISMATCH_STREAK):
             ctx.user_data[LANG_MISMATCH_STREAK] = 0
 
-    # 👇 показываем статус "печатает" перед генерацией
+    # "печатает…" перед генерацией и на ретраях
     try:
         await update.effective_chat.send_action(ChatAction.TYPING)
     except Exception:
         pass
 
-    # Генерация ответа (1-я попытка)
-    try:
-        reply = await call_openrouter(char, lang, user_text, temperature=0.7)
-    except httpx.HTTPStatusError as e:
-        log.exception("OpenRouter HTTP error")
-        await update.message.reply_text(f"LLM HTTP {e.response.status_code}: {e.response.reason_phrase}")
-        return
-    except Exception as e:
-        log.exception("OpenRouter error")
-        await update.message.reply_text(f"LLM ошибка: {e}")
-        return
-
-    # если ответ мусорный — 2-я попытка с более «сдержанными» параметрами
-    if looks_bad(reply):
-        log.warning("Bad reply detected, retrying with temperature=0.4")
+    # Многошаговый ретрай с убывающей температурой
+    attempt_params = [0.7, 0.5, 0.3]
+    reply = None
+    for idx, temp in enumerate(attempt_params, start=1):
         try:
-            # 👇 снова показываем "печатает" на ретрае
+            # держим индикатор "печатает" на каждой попытке
             try:
                 await update.effective_chat.send_action(ChatAction.TYPING)
             except Exception:
                 pass
-            reply = await call_openrouter(char, lang, user_text, temperature=0.4)
-        except Exception:
-            pass
 
-    # финальная зачистка/порог
-    if looks_bad(reply):
-        reply = "Давай попробуем ещё раз — сформулируй мысль чуть точнее."
+            cand = await call_openrouter(char, lang, user_text, temperature=temp)
+            if not looks_bad(cand, lang=lang):
+                reply = cand
+                break
+            else:
+                log.warning("Bad reply (attempt %d): %r", idx, cand[:120])
+        except httpx.HTTPStatusError as e:
+            log.exception("OpenRouter HTTP error on attempt %d", idx)
+            await update.message.reply_text(f"LLM HTTP {e.response.status_code}: {e.response.reason_phrase}")
+            return
+        except Exception as e:
+            log.exception("OpenRouter error on attempt %d", idx)
+            # пробуем дальше
+
+    if not reply:
+        reply = fallback_line(char, lang)
 
     await update.message.reply_text(reply)
 
