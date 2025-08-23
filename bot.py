@@ -45,7 +45,7 @@ RUNPOD_RUNSYNC_URL = (
 
 # OpenRouter (LLM для диалогов)
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "nothingiisreal/mn-celeste-12b")
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "neversleep/llama-3-lumimaid-8b")
 OR_HTTP_REFERER = os.getenv("OR_HTTP_REFERER", "https://pixorbibot.onrender.com")
 OR_X_TITLE = os.getenv("OR_X_TITLE", "PixorbiDream")
 
@@ -248,3 +248,4 @@ if __name__ == "__main__":
         except Conflict:
             log.warning("409 Conflict (другой инстанс бота). Жду 5 сек и пробую снова…")
             time.sleep(5)
+
