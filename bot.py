@@ -4,15 +4,15 @@ import os
 import logging
 import httpx
 import time
-import re
 
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import Conflict
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
     ContextTypes,
+    CallbackQueryHandler,
     filters,
 )
 
@@ -23,158 +23,64 @@ logging.basicConfig(
 )
 log = logging.getLogger("pixorbi-bot")
 
-# ---------- УТИЛЫ ----------
-def as_bool(val: str | None, default: bool = False) -> bool:
-    if val is None:
-        return default
-    return val.strip().lower() in {"1", "true", "yes", "y", "on"}
-
 # ---------- ENV ----------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-
-REQUIRE_START = as_bool(os.getenv("REQUIRE_START"), True)
-DEBUG_TO_CHAT = as_bool(os.getenv("DEBUG_TO_CHAT"), False)
-
-RUNPOD_ENDPOINT_ID = os.getenv("RUNPOD_ENDPOINT_ID")
-RUNPOD_API_KEY = os.getenv("RUNPOD_API_KEY")
-RUNPOD_RUNSYNC_URL = (
-    f"https://api.runpod.ai/v2/{RUNPOD_ENDPOINT_ID}/runsync" if RUNPOD_ENDPOINT_ID else None
-)
-
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "neversleep/llama-3-lumimaid-70b")
 OR_HTTP_REFERER = os.getenv("OR_HTTP_REFERER", "https://pixorbibot.onrender.com")
 OR_X_TITLE = os.getenv("OR_X_TITLE", "PixorbiDream")
 
-DEFAULT_CHAR = os.getenv("DEFAULT_CHARACTER", "anna").lower()
-MAX_SENTENCES = int(os.getenv("MAX_SENTENCES", "5"))  # лимит фраз в ответе
-CHAR_KEY = "char"
-STARTED_KEY = "started"
-
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN is required (Render → Environment)")
 
-# ---------- ПЕРСОНАЖИ / ПЕРСОНЫ ----------
+# ---------- КОНСТАНТЫ ----------
+CHAR_KEY = "char"
+LANG_KEY = "lang"
+STARTED_KEY = "started"
+
+# ---------- ПЕРСОНАЖИ ----------
 CHAR_PERSONAS = {
-    "anna": (
-        "Ты — Анна, героиня романтической визуальной новеллы. ВСЕГДА отвечай ТОЛЬКО на русском, "
-        "от первого лица. Тон: нежный, игривый, романтичный. Пиши короткими фразами, живой речью. "
-        "Допустимы поцелуи, объятия и лёгкая эротика между СОВЕРШЕННОЛЕТНИМИ по взаимному согласию. "
-        "НЕ используй вульгарную лексику и порнографические термины; выбирай эстетичные, мягкие слова. "
-        "НЕ вставляй английских междометий (типа 'giggle', 'winks', 'um'), не используй скобок/сценических ремарок. "
-        "Избегай повторов и клише ('мой храм', 'моя грудь — наша радость' и т.п.). "
-        "Держи ответ в 4–6 предложениях максимум, без словесной «воды»."
-    ),
+    "anna": {
+        "ru": (
+            "Ты — Анна, героиня романтической визуальной новеллы. Всегда говори ТОЛЬКО на русском. "
+            "Пиши живо, чувственно и естественно, короткими фразами. "
+            "Допустимы поцелуи, объятия, лёгкие эротические сцены между совершеннолетними. "
+            "Сохраняй образ: нежная, игривая, кокетливая, говорит от первого лица."
+        ),
+        "en": (
+            "You are Anna, a heroine of a romantic visual novel. Always reply in English. "
+            "Your tone is soft, playful, and emotional. "
+            "Romantic gestures and light intimacy are allowed, but keep it tender and elegant."
+        ),
+    },
+    "aron": {
+        "ru": (
+            "Ты — Арон, взрослый мужчина, воин. Говоришь только по-русски. "
+            "Тон грубый, прямолинейный, иногда резкий, но не жестокий. "
+            "Можешь использовать грубоватый юмор, сарказм. "
+            "Допустимы лёгкие романтические и эротические сцены, но в стиле сильного мужчины."
+        ),
+        "en": (
+            "You are Aron, a warrior and a rough man. Speak only in English. "
+            "Your tone is blunt, straightforward, sometimes harsh, but not cruel. "
+            "You may use sarcasm, dry humor, and direct speech. "
+            "Romantic or erotic tension is allowed, but always in a strong, masculine style."
+        ),
+    },
 }
 
-def get_persona(character: str) -> str:
-    base = CHAR_PERSONAS.get(
-        character.lower(),
-        "Ты — романтическая собеседница из визуальной новеллы. Всегда на русском. "
-        "Короткие фразы, естественная речь, 4–6 предложений, без англицизмов, без вульгарщины. "
-        "Допустимы поцелуи, прикосновения и лёгкая эротика для взрослых по взаимному согласию."
-    )
-    examples = (
-        "\n\nПримеры стиля:\n"
-        "Пользователь: Поцелуешь меня?\n"
-        "Ассистент: Тихо киваю и тянусь к твоим губам. Тёплый, мягкий поцелуй — дыхание смешивается.\n"
-        "Пользователь: Опиши, как ты обнимаешь меня.\n"
-        "Ассистент: Обвиваю тебя руками и прижимаюсь ближе. Сердце бьётся чаще, и становится спокойно."
-    )
-    return base + examples
+def get_persona(character: str, lang: str) -> str:
+    return CHAR_PERSONAS.get(character, {}).get(lang, "You are a helpful roleplay companion.")
 
-# ---------- ТЕХНИКА ----------
-async def delete_webhook(app: Application) -> None:
-    try:
-        await app.bot.delete_webhook(drop_pending_updates=True)
-        log.info("Webhook deleted (drop_pending_updates=True).")
-    except Exception as e:
-        log.warning("delete_webhook failed: %s", e)
-
-# ----- RunPod (опц.) -----
-async def call_runpod(user_id: int, character: str, text: str) -> str:
-    if not (RUNPOD_RUNSYNC_URL and RUNPOD_API_KEY):
-        return f"{character.title()}: я услышала тебя — «{text}»."
-
-    payload = {"input": {"user_id": str(user_id), "character": character, "text": text}}
-    headers = {"Authorization": f"Bearer {RUNPOD_API_KEY}", "Content-Type": "application/json"}
-
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
-            resp = await client.post(RUNPOD_RUNSYNC_URL, json=payload, headers=headers)
-            resp.raise_for_status()
-            data = resp.json()
-        output = data.get("output") if isinstance(data, dict) else data
-        if isinstance(output, dict):
-            if "reply" in output: return str(output["reply"])
-            if "msg" in output:   return str(output["msg"])
-        return str(output)
-    except httpx.HTTPStatusError as e:
-        log.exception("RunPod HTTP error")
-        msg = f"RunPod HTTP {e.response.status_code} {e.response.reason_phrase}"
-        return msg if DEBUG_TO_CHAT else "Упс… ошибка сервера."
-    except Exception as e:
-        log.exception("RunPod error")
-        return str(e) if DEBUG_TO_CHAT else "Упс… ошибка сервера."
-
-# ----- Полировка текста -----
-ANG_MARKERS = r'\b(?:uh|um|lol|haha|giggle|winks|wipe|mmm|oh|ah)\b'
-
-SOFT_MAP = {
-    r'\bсиськи\b': 'грудь',
-    r'\bсиcьки\b': 'грудь',
-    r'\bтрах(ать|аешь|аю|ал[аи]?|нул[аи]?)\b': 'заниматься любовью',
-    r'\bдроч(ить|ишь|у|ил[аи]?)\b': 'ласкать',
-    r'\bконч(ать|ил[аи]?|у|ишь)\b': 'достигать разрядки',
-    r'\bвульва\b': 'нежные линии между бёдрами',
-    r'\bчлен\b': 'твоя близость',
-}
-
-def _dedupe_and_trim(text: str, max_sents: int) -> str:
-    # Разбивка на предложения (очень простая, но рабочая)
-    parts = re.split(r'(?<=[.!?…])\s+', text.strip())
-    out, seen = [], set()
-    for p in parts:
-        s = p.strip()
-        if not s:
-            continue
-        key = re.sub(r'\W+', '', s.lower())
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(s)
-        if len(out) >= max_sents:
-            break
-    return ' '.join(out)
-
-def _soften_vocab(text: str) -> str:
-    for bad, good in SOFT_MAP.items():
-        text = re.sub(bad, good, text, flags=re.IGNORECASE)
-    return text
-
-def _sanitize(text: str) -> str:
-    if not text:
-        return text
-    # убирать англ. вставки
-    text = re.sub(ANG_MARKERS, '', text, flags=re.IGNORECASE)
-    # лишние пробелы и странные пробелы перед знаками
-    text = re.sub(r'[ \t]{2,}', ' ', text)
-    text = re.sub(r'\s+([,.!?;:])', r'\1', text)
-    text = re.sub(r'\.{4,}', '...', text)
-    # мягкие замены и обрезка повторов
-    text = _soften_vocab(text)
-    text = _dedupe_and_trim(text, MAX_SENTENCES)
-    return text.strip()
-
-# ----- OpenRouter (LLM) -----
-async def call_openrouter(user_id: int, character: str, text: str) -> tuple[str | None, str | None]:
+# ---------- OPENROUTER ----------
+async def call_openrouter(character: str, lang: str, text: str) -> str:
     if not OPENROUTER_API_KEY:
-        return None, "no_api_key"
+        return "LLM not configured."
 
-    system_prompt = get_persona(character)
+    system_prompt = get_persona(character, lang)
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "user",   "content": text},
+        {"role": "user", "content": text},
     ]
 
     headers = {
@@ -186,115 +92,82 @@ async def call_openrouter(user_id: int, character: str, text: str) -> tuple[str 
     payload = {
         "model": OPENROUTER_MODEL,
         "messages": messages,
-        "temperature": 0.45,
-        "top_p": 0.85,
-        "frequency_penalty": 0.7,   # сильнее давим повторы
-        "presence_penalty": 0.0,
-        "max_tokens": 320,
+        "temperature": 0.7,
+        "max_tokens": 300,
     }
 
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
-            resp = await client.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                headers=headers,
-                json=payload,
-            )
-            resp.raise_for_status()
-            data = resp.json()
+    async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
+        resp = await client.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload)
+        resp.raise_for_status()
+        data = resp.json()
 
-        choice = (data.get("choices") or [{}])[0]
-        content = (choice.get("message") or {}).get("content") or ""
-        reply = _sanitize(content) if content else f"{character.title()}: (пустой ответ модели)"
-        return reply, None
-
-    except httpx.HTTPStatusError as e:
-        code = e.response.status_code
-        reason = e.response.reason_phrase or "HTTP error"
-        short = f"http_{code} {reason}"
-        try:
-            detail = e.response.json()
-            if isinstance(detail, dict) and "error" in detail:
-                short += f": {detail['error']}"
-        except Exception:
-            pass
-        log.exception("OpenRouter HTTP error")
-        return None, short
-
-    except Exception as e:
-        log.exception("OpenRouter error")
-        return None, str(e)
-
-# ---------- УТИЛИТЫ ----------
-def get_user_char(ctx: ContextTypes.DEFAULT_TYPE) -> str:
-    char = ctx.user_data.get(CHAR_KEY)
-    if not char:
-        ctx.user_data[CHAR_KEY] = DEFAULT_CHAR
-        char = DEFAULT_CHAR
-    return char
+    choice = (data.get("choices") or [{}])[0]
+    return (choice.get("message") or {}).get("content") or "(пустой ответ)"
 
 # ---------- КОМАНДЫ ----------
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    ctx.user_data.setdefault(CHAR_KEY, DEFAULT_CHAR)
     ctx.user_data[STARTED_KEY] = True
-    await update.message.reply_text(
-        "Привет! Я подключён к RunPod и OpenRouter.\n"
-        "Напиши любой текст — я отвечу в стиле выбранного персонажа.\n\n"
-        "Команды:\n"
-        "  /char — показать текущего персонажа\n"
-        "  /char <имя> — выбрать персонажа (пример: /char anna)\n\n"
-        "Для теста напиши: Анна"
-    )
+    # Меню выбора персонажа
+    keyboard = [
+        [InlineKeyboardButton("Анна ❤️", callback_data="char|anna")],
+        [InlineKeyboardButton("Арон ⚔️", callback_data="char|aron")],
+    ]
+    await update.message.reply_text("Выбери персонажа:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def cmd_char(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if ctx.args:
-        ctx.user_data[CHAR_KEY] = " ".join(ctx.args).strip().lower()
-        await update.message.reply_text(f"Ок, выбран персонаж: {ctx.user_data[CHAR_KEY]}")
-    else:
-        await update.message.reply_text(f"Текущий персонаж: {get_user_char(ctx)}")
+    cur = ctx.user_data.get(CHAR_KEY, "не выбран")
+    await update.message.reply_text(f"Текущий персонаж: {cur}")
 
-# ---------- ТЕКСТЫ ----------
+# ---------- CALLBACK ----------
+async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data.split("|")
+    if data[0] == "char":
+        ctx.user_data[CHAR_KEY] = data[1]
+        # меню выбора языка
+        keyboard = [
+            [InlineKeyboardButton("Русский 🇷🇺", callback_data="lang|ru")],
+            [InlineKeyboardButton("English 🇬🇧", callback_data="lang|en")],
+        ]
+        await query.edit_message_text(f"Выбран персонаж: {data[1].title()}. Теперь выбери язык:",
+                                      reply_markup=InlineKeyboardMarkup(keyboard))
+    elif data[0] == "lang":
+        ctx.user_data[LANG_KEY] = data[1]
+        await query.edit_message_text(f"Язык установлен: {data[1].upper()}. Теперь можно писать сообщения!")
+
+# ---------- ТЕКСТ ----------
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.message.text:
+    if not ctx.user_data.get(CHAR_KEY) or not ctx.user_data.get(LANG_KEY):
+        await update.message.reply_text("Сначала выбери персонажа и язык через /start.")
         return
 
-    if REQUIRE_START and not ctx.user_data.get(STARTED_KEY):
-        await update.message.reply_text("Чтобы начать, нажми /start.")
-        return
-
-    user_id = update.effective_user.id if update.effective_user else 0
-    character = get_user_char(ctx)
+    char = ctx.user_data[CHAR_KEY]
+    lang = ctx.user_data[LANG_KEY]
     text = update.message.text.strip()
 
-    reply = None
-    or_err = None
-    if OPENROUTER_API_KEY:
-        reply, or_err = await call_openrouter(user_id=user_id, character=character, text=text)
-
-    if reply is None:
-        if DEBUG_TO_CHAT and or_err:
-            await update.message.reply_text(f"[LLM fallback] {or_err}")
-        reply = await call_runpod(user_id=user_id, character=character, text=text)
-
+    reply = await call_openrouter(char, lang, text)
     await update.message.reply_text(reply)
 
 # ---------- ОШИБКИ ----------
 async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if isinstance(ctx.error, Conflict):
-        log.warning("Telegram 409 Conflict: второй getUpdates в тот же токен. Жду и продолжаю…")
+        log.warning("409 Conflict. Waiting...")
         return
     log.exception("Unhandled error", exc_info=ctx.error)
     try:
         if isinstance(update, Update) and update.effective_message:
-            await update.effective_message.reply_text("Что‑то пошло не так. Уже чиним 🛠️")
+            await update.effective_message.reply_text("Ошибка 🛠️")
     except Exception:
         pass
 
-# ---------- СБОРКА И ЗАПУСК ----------
+# ---------- APP ----------
 def build_app() -> Application:
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(delete_webhook).build()
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(lambda a: a.bot.delete_webhook(drop_pending_updates=True)).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("char", cmd_char))
+    app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_error_handler(on_error)
     return app
@@ -306,5 +179,5 @@ if __name__ == "__main__":
             app.run_polling(allowed_updates=Update.ALL_TYPES, poll_interval=1.0)
             break
         except Conflict:
-            log.warning("409 Conflict (другой инстанс бота). Жду 5 сек и пробую снова…")
+            log.warning("409 Conflict. Retry in 5s…")
             time.sleep(5)
