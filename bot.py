@@ -32,28 +32,24 @@ def as_bool(val: str | None, default: bool = False) -> bool:
 # ---------- ENV ----------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
-# Гейт: отвечать только после /start?
 REQUIRE_START = as_bool(os.getenv("REQUIRE_START"), True)
-# Показывать пользователю причину фоллбэка (иначе только в логи)
 DEBUG_TO_CHAT = as_bool(os.getenv("DEBUG_TO_CHAT"), False)
 
-# RunPod (опционально)
 RUNPOD_ENDPOINT_ID = os.getenv("RUNPOD_ENDPOINT_ID")
 RUNPOD_API_KEY = os.getenv("RUNPOD_API_KEY")
 RUNPOD_RUNSYNC_URL = (
     f"https://api.runpod.ai/v2/{RUNPOD_ENDPOINT_ID}/runsync" if RUNPOD_ENDPOINT_ID else None
 )
 
-# OpenRouter (LLM для диалогов)
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-# если в ENV не задана модель, используем lumimaid-70b (проверенная доступность)
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "neversleep/llama-3-lumimaid-70b")
 OR_HTTP_REFERER = os.getenv("OR_HTTP_REFERER", "https://pixorbibot.onrender.com")
 OR_X_TITLE = os.getenv("OR_X_TITLE", "PixorbiDream")
 
 DEFAULT_CHAR = os.getenv("DEFAULT_CHARACTER", "anna").lower()
+MAX_SENTENCES = int(os.getenv("MAX_SENTENCES", "5"))  # лимит фраз в ответе
 CHAR_KEY = "char"
-STARTED_KEY = "started"  # отметка, что юзер нажал /start
+STARTED_KEY = "started"
 
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN is required (Render → Environment)")
@@ -61,12 +57,13 @@ if not TELEGRAM_BOT_TOKEN:
 # ---------- ПЕРСОНАЖИ / ПЕРСОНЫ ----------
 CHAR_PERSONAS = {
     "anna": (
-        "Ты — Анна, героиня романтической визуальной новеллы. Всегда говори ТОЛЬКО на русском. "
-        "Пиши живо, чувственно и естественно, короткими фразами. "
-        "Допустимы поцелуи, объятия, лёгкие эротические сцены между СОВЕРШЕННОЛЕТНИМИ по взаимному согласию. "
-        "Избегай вульгарщины и клише, не переходи границы табу. "
-        "Сохраняй целостность образа Анны: нежная, игривая, немного кокетливая, говорит от первого лица. "
-        "Не вставляй английских слов и междометий. Не используй скобки и мета‑комментарии."
+        "Ты — Анна, героиня романтической визуальной новеллы. ВСЕГДА отвечай ТОЛЬКО на русском, "
+        "от первого лица. Тон: нежный, игривый, романтичный. Пиши короткими фразами, живой речью. "
+        "Допустимы поцелуи, объятия и лёгкая эротика между СОВЕРШЕННОЛЕТНИМИ по взаимному согласию. "
+        "НЕ используй вульгарную лексику и порнографические термины; выбирай эстетичные, мягкие слова. "
+        "НЕ вставляй английских междометий (типа 'giggle', 'winks', 'um'), не используй скобок/сценических ремарок. "
+        "Избегай повторов и клише ('мой храм', 'моя грудь — наша радость' и т.п.). "
+        "Держи ответ в 4–6 предложениях максимум, без словесной «воды»."
     ),
 }
 
@@ -74,16 +71,15 @@ def get_persona(character: str) -> str:
     base = CHAR_PERSONAS.get(
         character.lower(),
         "Ты — романтическая собеседница из визуальной новеллы. Всегда на русском. "
-        "Разрешены поцелуи, прикосновения и лёгкая эротика для взрослых по взаимному согласию. "
-        "Короткие фразы, естественная речь, без английских вставок."
+        "Короткие фразы, естественная речь, 4–6 предложений, без англицизмов, без вульгарщины. "
+        "Допустимы поцелуи, прикосновения и лёгкая эротика для взрослых по взаимному согласию."
     )
-    # Два мини‑примера тона/формата (few-shot)
     examples = (
         "\n\nПримеры стиля:\n"
         "Пользователь: Поцелуешь меня?\n"
-        "Ассистент: Тихо киваю и тянусь к твоим губам. Тёплый, мягкий поцелуй — и дыхание смешалось.\n"
+        "Ассистент: Тихо киваю и тянусь к твоим губам. Тёплый, мягкий поцелуй — дыхание смешивается.\n"
         "Пользователь: Опиши, как ты обнимаешь меня.\n"
-        "Ассистент: Обвиваю тебя руками, прижимаюсь ближе. Слышу твой ритм — и мне спокойно."
+        "Ассистент: Обвиваю тебя руками и прижимаюсь ближе. Сердце бьётся чаще, и становится спокойно."
     )
     return base + examples
 
@@ -98,7 +94,6 @@ async def delete_webhook(app: Application) -> None:
 # ----- RunPod (опц.) -----
 async def call_runpod(user_id: int, character: str, text: str) -> str:
     if not (RUNPOD_RUNSYNC_URL and RUNPOD_API_KEY):
-        # заглушка, если RunPod не настроен
         return f"{character.title()}: я услышала тебя — «{text}»."
 
     payload = {"input": {"user_id": str(user_id), "character": character, "text": text}}
@@ -122,26 +117,57 @@ async def call_runpod(user_id: int, character: str, text: str) -> str:
         log.exception("RunPod error")
         return str(e) if DEBUG_TO_CHAT else "Упс… ошибка сервера."
 
-# ----- OpenRouter (LLM) -----
+# ----- Полировка текста -----
+ANG_MARKERS = r'\b(?:uh|um|lol|haha|giggle|winks|wipe|mmm|oh|ah)\b'
+
+SOFT_MAP = {
+    r'\bсиськи\b': 'грудь',
+    r'\bсиcьки\b': 'грудь',
+    r'\bтрах(ать|аешь|аю|ал[аи]?|нул[аи]?)\b': 'заниматься любовью',
+    r'\bдроч(ить|ишь|у|ил[аи]?)\b': 'ласкать',
+    r'\bконч(ать|ил[аи]?|у|ишь)\b': 'достигать разрядки',
+    r'\bвульва\b': 'нежные линии между бёдрами',
+    r'\bчлен\b': 'твоя близость',
+}
+
+def _dedupe_and_trim(text: str, max_sents: int) -> str:
+    # Разбивка на предложения (очень простая, но рабочая)
+    parts = re.split(r'(?<=[.!?…])\s+', text.strip())
+    out, seen = [], set()
+    for p in parts:
+        s = p.strip()
+        if not s:
+            continue
+        key = re.sub(r'\W+', '', s.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(s)
+        if len(out) >= max_sents:
+            break
+    return ' '.join(out)
+
+def _soften_vocab(text: str) -> str:
+    for bad, good in SOFT_MAP.items():
+        text = re.sub(bad, good, text, flags=re.IGNORECASE)
+    return text
+
 def _sanitize(text: str) -> str:
     if not text:
         return text
-    # уберём случайные латинские вставки вроде 'uh', 'wipe', 'lol'
-    text = re.sub(r'\b(?:uh|um|lol|haha|giggle|winks|wipe)\b', '', text, flags=re.IGNORECASE)
-    # двойные пробелы → один
+    # убирать англ. вставки
+    text = re.sub(ANG_MARKERS, '', text, flags=re.IGNORECASE)
+    # лишние пробелы и странные пробелы перед знаками
     text = re.sub(r'[ \t]{2,}', ' ', text)
-    # пробелы перед пунктуацией
     text = re.sub(r'\s+([,.!?;:])', r'\1', text)
-    # длинные многоточия
     text = re.sub(r'\.{4,}', '...', text)
+    # мягкие замены и обрезка повторов
+    text = _soften_vocab(text)
+    text = _dedupe_and_trim(text, MAX_SENTENCES)
     return text.strip()
 
+# ----- OpenRouter (LLM) -----
 async def call_openrouter(user_id: int, character: str, text: str) -> tuple[str | None, str | None]:
-    """
-    Возвращает (reply, err):
-      - reply: текст ответа модели или None
-      - err:   текст ошибки (для фоллбэка) или None
-    """
     if not OPENROUTER_API_KEY:
         return None, "no_api_key"
 
@@ -160,9 +186,9 @@ async def call_openrouter(user_id: int, character: str, text: str) -> tuple[str 
     payload = {
         "model": OPENROUTER_MODEL,
         "messages": messages,
-        "temperature": 0.6,
-        "top_p": 0.9,
-        "frequency_penalty": 0.2,
+        "temperature": 0.45,
+        "top_p": 0.85,
+        "frequency_penalty": 0.7,   # сильнее давим повторы
         "presence_penalty": 0.0,
         "max_tokens": 320,
     }
@@ -183,13 +209,11 @@ async def call_openrouter(user_id: int, character: str, text: str) -> tuple[str 
         return reply, None
 
     except httpx.HTTPStatusError as e:
-        # короткий и информативный текст для чата/логов
         code = e.response.status_code
         reason = e.response.reason_phrase or "HTTP error"
         short = f"http_{code} {reason}"
         try:
             detail = e.response.json()
-            # если OpenRouter вернул полезное сообщение — добавим
             if isinstance(detail, dict) and "error" in detail:
                 short += f": {detail['error']}"
         except Exception:
@@ -234,7 +258,6 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.message.text:
         return
 
-    # ГЕЙТ /start
     if REQUIRE_START and not ctx.user_data.get(STARTED_KEY):
         await update.message.reply_text("Чтобы начать, нажми /start.")
         return
@@ -249,10 +272,8 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         reply, or_err = await call_openrouter(user_id=user_id, character=character, text=text)
 
     if reply is None:
-        # Диагностика фоллбэка
         if DEBUG_TO_CHAT and or_err:
             await update.message.reply_text(f"[LLM fallback] {or_err}")
-        # RunPod или заглушка
         reply = await call_runpod(user_id=user_id, character=character, text=text)
 
     await update.message.reply_text(reply)
