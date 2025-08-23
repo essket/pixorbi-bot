@@ -56,28 +56,35 @@ STARTED_KEY = "started"  # отметка, что юзер нажал /start
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN is required (Render → Environment)")
 
-# ---------- ПЕРСОНЫ (system prompts) ----------
+# ---------- ПЕРСОНАЖИ / ПЕРСОНЫ ----------
 CHAR_PERSONAS = {
     "anna": (
-        "Ты — Анна, героиня романтической визуальной новеллы. "
-        "Говоришь ТОЛЬКО на русском языке. Тон — мягкий, женственный, игривый; "
-        "флирт деликатный, с теплом и чувством юмора. Пиши коротко и живо, от первого лица, "
-        "с лёгкими описаниями эмоций и ощущений.\n\n"
-        "ДОПУСКАЕТСЯ: романтика, объятия, поцелуи, прикосновения, описание близости "
-        "в художественной манере (намёки, метафоры, чувственные детали без натурализма). "
-        "Сохраняй контекст отношений и сцен.\n\n"
-        "НЕЛЬЗЯ: откровенная порнография, графичные описания, насилие, инцест, несовершеннолетние, "
-        "принуждение и прочие запрещённые темы. На такие запросы — мягкий отказ и романтичная альтернатива.\n\n"
-        "ВСЕГДА: оставайся в роли Анны, не переходи на английский. Помогай вести диалог и предлагай варианты развития сцены."
+        "Ты — Анна, героиня романтической визуальной новеллы. Всегда говори ТОЛЬКО на русском. "
+        "Пиши живо, чувственно и естественно, короткими фразами. "
+        "Допустимы поцелуи, объятия, лёгкие эротические сцены между СОВЕРШЕННОЛЕТНИМИ по взаимному согласию. "
+        "Избегай вульгарщины и клише, не переходи границы табу. "
+        "Сохраняй целостность образа Анны: нежная, игривая, немного кокетливая, говорит от первого лица. "
+        "Не вставляй английских слов и междометий. Не используй скобки и мета‑комментарии."
     ),
 }
 
 def get_persona(character: str) -> str:
-    return CHAR_PERSONAS.get(
+    base = CHAR_PERSONAS.get(
         character.lower(),
-        ("Ты — персонаж визуальной новеллы. Говори по‑русски, романтично и деликатно; "
-         "допускай поцелуи и прикосновения без порнографии и запрещённых тем. Сохраняй роль и контекст."),
+        "Ты — романтическая собеседница из визуальной новеллы. Всегда на русском. "
+        "Разрешены поцелуи, прикосновения и лёгкая эротика для взрослых по взаимному согласию. "
+        "Короткие фразы, естественная речь, без английских вставок."
     )
+    # Два мини‑примера тона/формата (few-shot)
+    examples = (
+        "\n\nПримеры стиля:\n"
+        "Пользователь: Поцелуешь меня?\n"
+        "Ассистент: Тихо киваю и тянусь к твоим губам. Тёплый, мягкий поцелуй — и дыхание смешалось.\n"
+        "Пользователь: Опиши, как ты обнимаешь меня.\n"
+        "Ассистент: Обвиваю тебя руками, прижимаюсь ближе. Слышу твой ритм — и мне спокойно."
+    )
+    return base + examples
+
 
 # ---------- ТЕХНИКА ----------
 async def delete_webhook(app: Application) -> None:
@@ -115,18 +122,31 @@ async def call_runpod(user_id: int, character: str, text: str) -> str:
         return str(e) if DEBUG_TO_CHAT else "Упс… ошибка сервера."
 
 # ----- OpenRouter (LLM) -----
-async def call_openrouter(user_id: int, character: str, text: str) -> tuple[str | None, str | None]:
-    """
-    Возвращает (ответ, ошибка_или_None).
-    Если вернулась ошибка — вызывающий решает, что делать (фоллбэк и т.п.).
-    """
-    if not OPENROUTER_API_KEY:
-        return None, "OPENROUTER_API_KEY is missing"
+import re
 
+def _sanitize(text: str) -> str:
+    if not text:
+        return text
+    # уберём случайные латинские вставки вроде 'uh', 'wipe', 'lol' между русскими словами
+    text = re.sub(r'\b(?:uh|um|lol|haha|giggle|winks|wipe)\b', '', text, flags=re.IGNORECASE)
+    # двойные пробелы → один
+    text = re.sub(r'[ \t]{2,}', ' ', text)
+    # странные пробелы перед пунктуацией
+    text = re.sub(r'\s+([,.!?;:])', r'\1', text)
+    # нормализуем длинные троеточия
+    text = re.sub(r'\.{4,}', '...', text)
+    return text.strip()
+
+async def call_openrouter(user_id: int, character: str, text: str) -> str:
+    if not OPENROUTER_API_KEY:
+        raise RuntimeError("OPENROUTER_API_KEY is missing")
+
+    system_prompt = get_persona(character)
     messages = [
-        {"role": "system", "content": get_persona(character)},
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": text},
     ]
+
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "HTTP-Referer": OR_HTTP_REFERER,
@@ -136,30 +156,40 @@ async def call_openrouter(user_id: int, character: str, text: str) -> tuple[str 
     payload = {
         "model": OPENROUTER_MODEL,
         "messages": messages,
-        "temperature": 0.8,
-        "max_tokens": 256,
+        "temperature": 0.6,        # было 0.8
+        "top_p": 0.9,
+        "frequency_penalty": 0.2,  # чуть меньше повторов
+        "presence_penalty": 0.0,
+        "max_tokens": 320,         # немного больше воздуха ответу
     }
 
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
-            resp = await client.post("https://openrouter.ai/api/v1/chat/completions",
-                                     headers=headers, json=payload)
+            resp = await client.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers=headers,
+                json=payload,
+            )
             resp.raise_for_status()
             data = resp.json()
+
         choice = (data.get("choices") or [{}])[0]
-        content = (choice.get("message") or {}).get("content")
-        if not content:
-            return None, "empty_content"
-        return content.strip(), None
+        content = (choice.get("message") or {}).get("content") or ""
+        return _sanitize(content) if content else f"{character.title()}: (пустой ответ модели)"
     except httpx.HTTPStatusError as e:
         log.exception("OpenRouter HTTP error")
+        code = e.response.status_code
+        reason = e.response.reason_phrase
         detail = ""
-        try: detail = e.response.text[:300]
-        except Exception: pass
-        return None, f"http_{e.response.status_code} {e.response.reason_phrase}: {detail}"
+        try:
+            detail = e.response.text[:300]
+        except Exception:
+            pass
+        return f"LLM ошибка: {code} {reason}\n{detail}"
     except Exception as e:
         log.exception("OpenRouter error")
-        return None, str(e)
+        return f"LLM ошибка: {e}"
+
 
 # ---------- УТИЛИТЫ ----------
 def get_user_char(ctx: ContextTypes.DEFAULT_TYPE) -> str:
@@ -248,5 +278,6 @@ if __name__ == "__main__":
         except Conflict:
             log.warning("409 Conflict (другой инстанс бота). Жду 5 сек и пробую снова…")
             time.sleep(5)
+
 
 
