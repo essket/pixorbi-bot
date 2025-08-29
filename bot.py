@@ -31,6 +31,8 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "thedrummer/unslopnemo-12b")
 OR_HTTP_REFERER = os.getenv("OR_HTTP_REFERER", "https://pixorbibot.onrender.com")
 OR_X_TITLE = os.getenv("OR_X_TITLE", "PixorbiDream")
+RUNPOD_HTTP = os.getenv("RUNPOD_HTTP")  # например: https://6sqer39lnzaydd.api.runpod.ai/chat
+
 
 def _as_bool(v: str | None, default=False) -> bool:
     if v is None:
@@ -226,6 +228,34 @@ async def send_action_safe(update: Update, action: ChatAction) -> None:
 
 # ---------- OPENROUTER ----------
 async def call_openrouter(character: str, lang: str, text: str, ctx: ContextTypes.DEFAULT_TYPE, temperature: float = 0.6) -> str:
+    """
+    Если задан RUNPOD_HTTP — шлём в твой бэкенд (/chat), вместе с историей.
+    Иначе — старый прямой вызов OpenRouter (fallback).
+    """
+    history = ctx.user_data.get(DIALOG_HISTORY) or []
+
+    if RUNPOD_HTTP:
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
+                r = await client.post(
+                    RUNPOD_HTTP,
+                    json={
+                        "character": character,
+                        "message": text,
+                        "history": history
+                    }
+                )
+                r.raise_for_status()
+                data = r.json()
+            content = (data or {}).get("reply", "") or ""
+            content = clean_text(content)
+            content = re.sub(r"([!?…])\1{3,}", r"\1\1", content)
+            return content or "(пустой ответ)"
+        except Exception as e:
+            # если вдруг бэкенд упал — мягко откатываемся на прямой OpenRouter
+            log.warning("RUNPOD_HTTP failed, falling back to OpenRouter: %s", e)
+
+    # ---- Fallback: прямой OpenRouter, как было ----
     if not OPENROUTER_API_KEY:
         return "(LLM не настроен)"
 
@@ -258,6 +288,7 @@ async def call_openrouter(character: str, lang: str, text: str, ctx: ContextType
     content = clean_text(content)
     content = re.sub(r"([!?…])\1{3,}", r"\1\1", content)
     return content or "(пустой ответ)"
+
 
 # ---------- КНОПКИ ----------
 def main_menu_kb() -> InlineKeyboardMarkup:
@@ -499,4 +530,5 @@ if __name__ == "__main__":
         except Conflict:
             log.warning("409 Conflict. Retry in 5s…")
             time.sleep(5)
+
 
