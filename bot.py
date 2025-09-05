@@ -23,7 +23,8 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
 )
-log = logging.getLogger("pixorbi-bot")
+log = getLogger = logging.getLogger
+log = getLogger("pixorbi-bot")
 
 # ---------- ENV ----------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -31,8 +32,15 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "thedrummer/unslopnemo-12b")
 OR_HTTP_REFERER = os.getenv("OR_HTTP_REFERER", "https://pixorbibot.onrender.com")
 OR_X_TITLE = os.getenv("OR_X_TITLE", "PixorbiDream")
-RUNPOD_HTTP = os.getenv("RUNPOD_HTTP")  # например: https://6sqer39lnzaydd.api.runpod.ai/chat
 
+# URL вашего бэкенда (лучше сразу указывать /chat): https://<id>.api.runpod.ai/chat
+RUNPOD_HTTP = os.getenv("RUNPOD_HTTP")
+
+# ⬇️ НОВОЕ: два ключа для доступа к бэкенду через LB
+# rpa_… = аккаунтный ключ Runpod (для Cloudflare/LB)
+RUNPOD_ACCOUNT_KEY = os.getenv("RUNPOD_ACCOUNT_KEY") or os.getenv("RUNPOD_API_KEY")
+# APP_KEY = внутренний ключ приложения (проверяется в app.py)
+APP_KEY = os.getenv("APP_KEY")
 
 def _as_bool(v: str | None, default=False) -> bool:
     if v is None:
@@ -79,11 +87,11 @@ CHAR_PERSONAS = {
         "ru": (
             "Ты — Арон, взрослый воин. Отвечай ТОЛЬКО на русском. "
             "Тон прямой, грубоватый, уверенный, но без жестокости. "
-            "Допустимы лёгкие романтические/эротические моменты для взрослых; стиль сдержанно‑мужской, без пошлятины."
+            "Допустимы лёгкие романтические/эротические моменты для взрослых; стиль сдержанно-мужской, без пошлятины."
         ),
         "en": (
             "You are Aron, a seasoned warrior. Reply ONLY in English. "
-            "Blunt, rough‑edged, confident tone (not cruel). "
+            "Blunt, rough-edged, confident tone (not cruel). "
             "Light adult romance allowed; keep it masculine and restrained, never vulgar."
         ),
     },
@@ -163,8 +171,8 @@ def detect_lang(text: str) -> str | None:
 LANG_REMINDERS = {
     "anna": {
         "ru": [
-            "Давай по‑русски, пожалуйста 😊",
-            "Я сейчас говорю только по‑русски. Переключишься?",
+            "Давай по-русски, пожалуйста 😊",
+            "Я сейчас говорю только по-русски. Переключишься?",
             "Без английского, ладно? На русском будет легче 💫",
             "Понимаю тебя, но отвечаю только на русском.",
         ],
@@ -177,9 +185,9 @@ LANG_REMINDERS = {
     },
     "aron": {
         "ru": [
-            "Пиши по‑русски. Быстро.",
+            "Пиши по-русски. Быстро.",
             "Русский здесь. Переключись.",
-            "По‑русски давай. Так проще.",
+            "По-русски давай. Так проще.",
             "Русский язык. Не усложняй.",
         ],
         "en": [
@@ -220,39 +228,45 @@ def looks_bad(s: str) -> bool:
 
 # ---------- TELEGRAM ACTIONS ----------
 async def send_action_safe(update: Update, action: ChatAction) -> None:
-    """Безопасно отправляем action (typing/upload_photo и т.д.)."""
     try:
         await update.effective_chat.send_action(action)
     except Exception:
         pass
 
-# ---------- OPENROUTER ----------
+# ---------- OPENROUTER / BACKEND ----------
 async def call_openrouter(character: str, lang: str, text: str, ctx: ContextTypes.DEFAULT_TYPE, temperature: float = 0.6) -> str:
     """
-    Если задан RUNPOD_HTTP — шлём в твой бэкенд (/chat), вместе с историей.
-    Иначе — старый прямой вызов OpenRouter (fallback).
+    Если задан RUNPOD_HTTP — шлём в ваш бэкенд (/chat), вместе с историей и
+    нужными заголовками. Иначе — прямой вызов OpenRouter (fallback).
     """
     history = ctx.user_data.get(DIALOG_HISTORY) or []
 
     if RUNPOD_HTTP:
         try:
+            headers = {"Content-Type": "application/json"}
+            if RUNPOD_ACCOUNT_KEY:
+                headers["Authorization"] = f"Bearer {RUNPOD_ACCOUNT_KEY}"
+            if APP_KEY:
+                headers["x-api-key"] = APP_KEY
+
             async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
                 r = await client.post(
                     RUNPOD_HTTP,
+                    headers=headers,
                     json={
                         "character": character,
                         "message": text,
-                        "history": history
-                    }
+                        "history": history,
+                    },
                 )
                 r.raise_for_status()
                 data = r.json()
+
             content = (data or {}).get("reply", "") or ""
             content = clean_text(content)
             content = re.sub(r"([!?…])\1{3,}", r"\1\1", content)
             return content or "(пустой ответ)"
         except Exception as e:
-            # если вдруг бэкенд упал — мягко откатываемся на прямой OpenRouter
             log.warning("RUNPOD_HTTP failed, falling back to OpenRouter: %s", e)
 
     # ---- Fallback: прямой OpenRouter, как было ----
@@ -278,8 +292,10 @@ async def call_openrouter(character: str, lang: str, text: str, ctx: ContextType
     }
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
-        r = await client.post("https://openrouter.ai/api/v1/chat/completions",
-                              headers=headers, json=payload)
+        r = await client.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers=headers, json=payload
+        )
         r.raise_for_status()
         data = r.json()
 
@@ -288,7 +304,6 @@ async def call_openrouter(character: str, lang: str, text: str, ctx: ContextType
     content = clean_text(content)
     content = re.sub(r"([!?…])\1{3,}", r"\1\1", content)
     return content or "(пустой ответ)"
-
 
 # ---------- КНОПКИ ----------
 def main_menu_kb() -> InlineKeyboardMarkup:
@@ -461,7 +476,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     # Индикатор «печатает»
     await send_action_safe(update, ChatAction.TYPING)
 
-    # Генерация ответа (1-я попытка)
+    # Генерация ответа
     try:
         reply = await call_openrouter(char, lang, user_text, ctx, temperature=0.6)
     except httpx.HTTPStatusError as e:
@@ -482,13 +497,10 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         except Exception:
             pass
 
-    # Финальная зачистка/порог
     if looks_bad(reply):
         reply = "Давай попробуем ещё раз — сформулируй мысль чуть точнее."
 
-    # Память: добавляем ответ ассистента
     _push_history(ctx, "assistant", reply)
-
     await update.message.reply_text(reply)
 
 # ---------- ОШИБКИ ----------
@@ -530,5 +542,3 @@ if __name__ == "__main__":
         except Conflict:
             log.warning("409 Conflict. Retry in 5s…")
             time.sleep(5)
-
-
