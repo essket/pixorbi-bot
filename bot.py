@@ -23,8 +23,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
 )
-log = getLogger = logging.getLogger
-log = getLogger("pixorbi-bot")
+log = logging.getLogger("pixorbi-bot")
 
 # ---------- ENV ----------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -36,10 +35,10 @@ OR_X_TITLE = os.getenv("OR_X_TITLE", "PixorbiDream")
 # URL вашего бэкенда (лучше сразу указывать /chat): https://<id>.api.runpod.ai/chat
 RUNPOD_HTTP = os.getenv("RUNPOD_HTTP")
 
-# ⬇️ НОВОЕ: два ключа для доступа к бэкенду через LB
+# два ключа для доступа к бэкенду через LB
 # rpa_… = аккаунтный ключ Runpod (для Cloudflare/LB)
 RUNPOD_ACCOUNT_KEY = os.getenv("RUNPOD_ACCOUNT_KEY") or os.getenv("RUNPOD_API_KEY")
-# APP_KEY = внутренний ключ приложения (проверяется в app.py)
+# APP_KEY = внутренний ключ приложения (проверяется в app.py бэкенда)
 APP_KEY = os.getenv("APP_KEY")
 
 def _as_bool(v: str | None, default=False) -> bool:
@@ -236,7 +235,7 @@ async def send_action_safe(update: Update, action: ChatAction) -> None:
 # ---------- OPENROUTER / BACKEND ----------
 async def call_openrouter(character: str, lang: str, text: str, ctx: ContextTypes.DEFAULT_TYPE, temperature: float = 0.6) -> str:
     """
-    Если задан RUNPOD_HTTP — шлём в ваш бэкенд (/chat), вместе с историей и
+    Если задан RUNPOD_HTTP — шлём в ваш бэкенд (/chat), вместе с историей, языком и
     нужными заголовками. Иначе — прямой вызов OpenRouter (fallback).
     """
     history = ctx.user_data.get(DIALOG_HISTORY) or []
@@ -255,6 +254,7 @@ async def call_openrouter(character: str, lang: str, text: str, ctx: ContextType
                     headers=headers,
                     json={
                         "character": character,
+                        "lang": lang,       # <-- ПЕРЕДАЁМ ЯЗЫК!
                         "message": text,
                         "history": history,
                     },
@@ -432,7 +432,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     if tag == "menu" and val == "change_lang":
         reset_setup(ctx)
-        await q.edit_message_text("Выбери язык:", reply_markup=choose_lang_kb())
+        await q.edit_message_text("Выбери язык:", reply_markup=choose_lang_kб())
         return
 
 # ---------- ТЕКСТ ----------
@@ -440,7 +440,6 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.message.text:
         return
 
-    # Пока не пройдён выбор — не общаемся
     if need_setup(ctx):
         if not ctx.user_data.get(CHAR_KEY):
             await update.message.reply_text("Сначала выбери персонажа:", reply_markup=choose_char_kb())
@@ -454,12 +453,10 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     lang = ctx.user_data.get(LANG_KEY)
     user_text = update.message.text.strip()
 
-    # Контроль языка пользователя
     in_lang = detect_lang(user_text)
     if in_lang and in_lang != lang:
         streak = int(ctx.user_data.get(LANG_MISMATCH_STREAK, 0)) + 1
         ctx.user_data[LANG_MISMATCH_STREAK] = streak
-
         reminder = get_lang_reminder(char, lang)
         if streak >= LANG_SWITCH_THRESHOLD:
             await update.message.reply_text(reminder, reply_markup=choose_lang_kb())
@@ -470,13 +467,9 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if ctx.user_data.get(LANG_MISMATCH_STREAK):
             ctx.user_data[LANG_MISMATCH_STREAK] = 0
 
-    # Память: добавляем реплику пользователя
     _push_history(ctx, "user", user_text)
-
-    # Индикатор «печатает»
     await send_action_safe(update, ChatAction.TYPING)
 
-    # Генерация ответа
     try:
         reply = await call_openrouter(char, lang, user_text, ctx, temperature=0.6)
     except httpx.HTTPStatusError as e:
@@ -488,7 +481,6 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"LLM ошибка: {e}")
         return
 
-    # Если ответ мусорный — 2-я попытка с более «сдержанными» параметрами
     if looks_bad(reply):
         log.warning("Bad reply detected, retrying with temperature=0.4")
         await send_action_safe(update, ChatAction.TYPING)
@@ -540,5 +532,5 @@ if __name__ == "__main__":
             app.run_polling(allowed_updates=Update.ALL_TYPES, poll_interval=1.0)
             break
         except Conflict:
-            log.warning("409 Conflict. Retry in 5s…")
+            logging.getLogger("pixorbi-bot").warning("409 Conflict. Retry in 5s…")
             time.sleep(5)
