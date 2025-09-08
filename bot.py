@@ -32,14 +32,14 @@ OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "thedrummer/unslopnemo-12b")
 OR_HTTP_REFERER = os.getenv("OR_HTTP_REFERER", "https://pixorbibot.onrender.com")
 OR_X_TITLE = os.getenv("OR_X_TITLE", "PixorbiDream")
 
-# URL вашего бэкенда (лучше сразу указывать /chat): https://<id>.api.runpod.ai/chat
-RUNPOD_HTTP = os.getenv("RUNPOD_HTTP")
+# URL бэкенда; нормализуем до .../chat
+RUNPOD_HTTP = (os.getenv("RUNPOD_HTTP") or "").strip()
+if RUNPOD_HTTP and not RUNPOD_HTTP.endswith("/chat"):
+    RUNPOD_HTTP = RUNPOD_HTTP.rstrip("/") + "/chat"
 
 # два ключа для доступа к бэкенду через LB
-# rpa_… = аккаунтный ключ Runpod (для Cloudflare/LB)
-RUNPOD_ACCOUNT_KEY = os.getenv("RUNPOD_ACCOUNT_KEY") or os.getenv("RUNPOD_API_KEY")
-# APP_KEY = внутренний ключ приложения (проверяется в app.py бэкенда)
-APP_KEY = os.getenv("APP_KEY")
+RUNPOD_ACCOUNT_KEY = os.getenv("RUNPOD_ACCOUNT_KEY") or os.getenv("RUNPOD_API_KEY")  # rpa_...
+APP_KEY = os.getenv("APP_KEY")  # внутренний ключ приложения (проверяется в app.py)
 
 def _as_bool(v: str | None, default=False) -> bool:
     if v is None:
@@ -235,8 +235,8 @@ async def send_action_safe(update: Update, action: ChatAction) -> None:
 # ---------- OPENROUTER / BACKEND ----------
 async def call_openrouter(character: str, lang: str, text: str, ctx: ContextTypes.DEFAULT_TYPE, temperature: float = 0.6) -> str:
     """
-    Если задан RUNPOD_HTTP — шлём в ваш бэкенд (/chat), вместе с историей, языком и
-    нужными заголовками. Иначе — прямой вызов OpenRouter (fallback).
+    Если задан RUNPOD_HTTP — шлём в бэкенд (/chat) с историей, языком и нужными заголовками.
+    Иначе — прямой вызов OpenRouter (fallback).
     """
     history = ctx.user_data.get(DIALOG_HISTORY) or []
 
@@ -254,7 +254,7 @@ async def call_openrouter(character: str, lang: str, text: str, ctx: ContextType
                     headers=headers,
                     json={
                         "character": character,
-                        "lang": lang,       # <-- ПЕРЕДАЁМ ЯЗЫК!
+                        "lang": lang,       # <-- ПЕРЕДАЁМ ЯЗЫК
                         "message": text,
                         "history": history,
                     },
@@ -266,10 +266,17 @@ async def call_openrouter(character: str, lang: str, text: str, ctx: ContextType
             content = clean_text(content)
             content = re.sub(r"([!?…])\1{3,}", r"\1\1", content)
             return content or "(пустой ответ)"
+        except httpx.HTTPStatusError as e:
+            body = ""
+            try:
+                body = e.response.text[:300]
+            except Exception:
+                pass
+            log.warning("RUNPOD_HTTP HTTP %s: %s", e.response.status_code, body)
         except Exception as e:
             log.warning("RUNPOD_HTTP failed, falling back to OpenRouter: %s", e)
 
-    # ---- Fallback: прямой OpenRouter, как было ----
+    # ---- Fallback: прямой OpenRouter ----
     if not OPENROUTER_API_KEY:
         return "(LLM не настроен)"
 
@@ -411,8 +418,10 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         ctx.user_data[CHAR_KEY] = val
         ctx.user_data.pop(LANG_KEY, None)
         reset_setup(ctx)
-        await q.edit_message_text(f"Выбран персонаж: {val.title()}. Теперь выбери язык:",
-                                  reply_markup=choose_lang_kb())
+        await q.edit_message_text(
+            f"Выбран персонаж: {val.title()}. Теперь выбери язык:",
+            reply_markup=choose_lang_kb(),
+        )
         return
 
     if tag == "lang" and val:
@@ -421,7 +430,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         ctx.user_data[LANG_MISMATCH_STREAK] = 0
         await q.edit_message_text(
             f"Язык установлен: {val.upper()}. Можно писать сообщения!",
-            reply_markup=main_menu_kb()
+            reply_markup=main_menu_kb(),
         )
         return
 
@@ -432,7 +441,8 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     if tag == "menu" and val == "change_lang":
         reset_setup(ctx)
-        await q.edit_message_text("Выбери язык:", reply_markup=choose_lang_kб())
+        # ВАЖНО: исправлена опечатка (kb, а не кб)
+        await q.edit_message_text("Выбери язык:", reply_markup=choose_lang_kb())
         return
 
 # ---------- ТЕКСТ ----------
@@ -440,6 +450,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.message.text:
         return
 
+    # Пока не пройдён выбор — не общаемся
     if need_setup(ctx):
         if not ctx.user_data.get(CHAR_KEY):
             await update.message.reply_text("Сначала выбери персонажа:", reply_markup=choose_char_kb())
@@ -453,10 +464,12 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     lang = ctx.user_data.get(LANG_KEY)
     user_text = update.message.text.strip()
 
+    # Контроль языка пользователя
     in_lang = detect_lang(user_text)
     if in_lang and in_lang != lang:
         streak = int(ctx.user_data.get(LANG_MISMATCH_STREAK, 0)) + 1
         ctx.user_data[LANG_MISMATCH_STREAK] = streak
+
         reminder = get_lang_reminder(char, lang)
         if streak >= LANG_SWITCH_THRESHOLD:
             await update.message.reply_text(reminder, reply_markup=choose_lang_kb())
@@ -467,9 +480,13 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if ctx.user_data.get(LANG_MISMATCH_STREAK):
             ctx.user_data[LANG_MISMATCH_STREAK] = 0
 
+    # Память: добавляем реплику пользователя
     _push_history(ctx, "user", user_text)
+
+    # Индикатор «печатает»
     await send_action_safe(update, ChatAction.TYPING)
 
+    # Генерация ответа
     try:
         reply = await call_openrouter(char, lang, user_text, ctx, temperature=0.6)
     except httpx.HTTPStatusError as e:
@@ -481,6 +498,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"LLM ошибка: {e}")
         return
 
+    # Если ответ мусорный — 2-я попытка
     if looks_bad(reply):
         log.warning("Bad reply detected, retrying with temperature=0.4")
         await send_action_safe(update, ChatAction.TYPING)
