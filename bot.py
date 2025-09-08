@@ -37,7 +37,7 @@ RUNPOD_HTTP = (os.getenv("RUNPOD_HTTP") or "").strip()
 if RUNPOD_HTTP and not RUNPOD_HTTP.endswith("/chat"):
     RUNPOD_HTTP = RUNPOD_HTTP.rstrip("/") + "/chat"
 
-# два ключа для доступа к бэкенду через LB
+# ключи для доступа к бэкенду через LB
 RUNPOD_ACCOUNT_KEY = os.getenv("RUNPOD_ACCOUNT_KEY") or os.getenv("RUNPOD_API_KEY")  # rpa_...
 APP_KEY = os.getenv("APP_KEY")  # внутренний ключ приложения (проверяется в app.py)
 
@@ -56,9 +56,10 @@ except Exception:
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN is required (Render → Environment)")
 
-# ---------- КЛЮЧИ / КОНСТАНТЫ ----------
-CHAR_KEY = "char"
-LANG_KEY = "lang"
+# ---------- КОНСТАНТЫ / ХРАНИЛКА ----------
+STORY_KEY = "story"
+CHAR_KEY  = "char"
+LANG_KEY  = "lang"
 STARTED_KEY = "started"
 AWAIT_SETUP = "await_setup"
 LANG_MISMATCH_STREAK = "lang_mismatch_streak"
@@ -66,96 +67,80 @@ LANG_MISMATCH_STREAK = "lang_mismatch_streak"
 DIALOG_HISTORY = "dialog_history"
 HIST_MAX_TURNS = 12  # хранить до 12 пользовательских + 12 ответов
 
-# ---------- ПЕРСОНАЖИ ----------
-CHAR_PERSONAS = {
-    "anna": {
-        "ru": (
-            "Ты — Анна, героиня романтической визуальной новеллы. Отвечай ТОЛЬКО на русском. "
-            "Тон мягкий, игривый, чувственный, короткие естественные фразы. "
-            "Разрешены поцелуи, объятия и лёгкая эротика между совершеннолетними по взаимному согласию, без вульгарщины. "
-            "Не используй англицизмы и сценические ремарки в скобках."
-        ),
-        "en": (
-            "You are Anna, a heroine from a romantic visual novel. Reply ONLY in English. "
-            "Soft, playful, tender tone with short natural sentences. "
-            "Light romance and intimacy between consenting adults is allowed; keep it tasteful. "
-            "Avoid meta stage directions in parentheses."
-        ),
-    },
-    "aron": {
-        "ru": (
-            "Ты — Арон, взрослый воин. Отвечай ТОЛЬКО на русском. "
-            "Тон прямой, грубоватый, уверенный, но без жестокости. "
-            "Допустимы лёгкие романтические/эротические моменты для взрослых; стиль сдержанно-мужской, без пошлятины."
-        ),
-        "en": (
-            "You are Aron, a seasoned warrior. Reply ONLY in English. "
-            "Blunt, rough-edged, confident tone (not cruel). "
-            "Light adult romance allowed; keep it masculine and restrained, never vulgar."
-        ),
+DEFAULT_STORY = os.getenv("DEFAULT_STORY", "hope")  # «Меня зовут Хоуп»
+
+# ---------- МЕТАДАННЫЕ ИСТОРИЙ И ПЕРСОНАЖЕЙ ----------
+# Все имена персонажей — слаги в нижнем регистре. Показываем удобные подписи на RU/EN.
+STORIES = {
+    "hope": {
+        "title_ru": "Меня зовут Хоуп",
+        "title_en": "My Name is Hope",
+        "characters": {
+            # все мужчины по описанию
+            "ellis":   {"ru": "Эллис",   "en": "Ellis"},
+            "james":   {"ru": "Джеймс",  "en": "James"},
+            "kyle":    {"ru": "Кайл",    "en": "Kyle"},
+            "keen":    {"ru": "Кин",     "en": "Keen"},
+            "zachary": {"ru": "Закари",  "en": "Zachary"},
+        },
     },
 }
 
-def lang_name(code: str) -> str:
-    return "Russian" if code == "ru" else "English"
-
+# Персонные промпты: жёсткая фиксация языка + стиль
 def persona_system_prompt(character: str, lang: str) -> str:
-    base = CHAR_PERSONAS.get(character, {}).get(
-        lang,
-        "You are a helpful roleplay companion. Reply ONLY in the chosen language.",
-    )
+    ch = (character or "").lower()
+    l  = (lang or "ru").lower()[:2]
+    name_map = STORIES["hope"]["characters"]  # пока одна история — берём из неё
+    display_name = name_map.get(ch, {}).get(l, ch.title())
+
+    base_ru = {
+        "ellis":   "Ты — Эллис, прямолинейный, заботливый и немного ироничный. Говоришь коротко и по делу, без грубости.",
+        "james":   "Ты — Джеймс, умный и спокойный, склонен анализировать и поддерживать.",
+        "kyle":    "Ты — Кайл, лёгкий и флиртующий, но не навязчивый. Поддерживаешь настроение.",
+        "keen":    "Ты — Кин, собранный и дисциплинированный, предпочитаешь чёткие формулировки.",
+        "zachary": "Ты — Закари, эмоциональный, но держишь себя в руках. Тёплый, доверительный тон.",
+    }
+    base_en = {
+        "ellis":   "You are Ellis: straightforward, caring, slightly ironic. Keep replies short and to the point.",
+        "james":   "You are James: smart, calm, analytical and supportive.",
+        "kyle":    "You are Kyle: light-hearted and flirty, never pushy. Keep the mood up.",
+        "keen":    "You are Keen: focused and disciplined. Prefer clear and concise wording.",
+        "zachary": "You are Zachary: emotional yet composed. Warm, trusting tone.",
+    }
+    base = (base_ru if l == "ru" else base_en).get(ch, "")
+
     enforce = (
-        f"\nHard rule: Respond strictly in {lang_name(lang)}. "
-        f"If the user speaks another language, still answer in {lang_name(lang)} "
-        f"and briefly remind them of the chosen language."
+        f"ЖЁСТКОЕ ПРАВИЛО: отвечай СТРОГО на русском. Имя: {display_name}. "
+        f"Если пользователь пишет не по-русски — всё равно отвечай по-русски и мягко напомни."
+        if l == "ru" else
+        f"HARD RULE: reply STRICTLY in English. Name: {display_name}. "
+        f"If the user uses another language, still answer in English and gently remind them."
     )
     canon = (
-        "\nConsistency rules:\n"
-        "- Никогда не противоречь фактам, уже сказанным тобой ранее в беседе.\n"
-        "- Держи один образ и биографию, если пользователь их не меняет.\n"
-        "- Анна говорит в женском роде от первого лица; не меняй пол/роль.\n"
-        "- Не выдумывай новых ведущих персонажей без явного запроса.\n"
-        "- Короткие естественные фразы; без англицизмов и ремарок в скобках."
-        if lang == "ru" else
+        "\nПравила согласованности:\n"
+        "- Не противоречь фактам, сказанным тобой ранее в этом чате.\n"
+        "- Держи один образ и биографию из канона истории.\n"
+        "- Говори короткими естественными фразами; без сценических ремарок в скобках."
+        if l == "ru" else
         "\nConsistency rules:\n"
         "- Never contradict facts you already stated in this chat.\n"
-        "- Keep a stable persona/biography unless the user changes it.\n"
-        "- Anna speaks in female first-person; never swap gender/role.\n"
-        "- Do not invent new leading characters unless requested.\n"
-        "- Short natural sentences; no stage directions in parentheses."
+        "- Keep a single persona/biography consistent with the story canon.\n"
+        "- Use short, natural sentences; no stage directions in parentheses."
     )
     fewshot = (
         "\n\nПримеры стиля:\n"
         "Пользователь: Поцелуешь меня?\n"
-        "Ассистент: Тихо киваю и тянусь к твоим губам. Тёплый, короткий поцелуй — дыхание смешалось.\n"
+        "Ассистент: Тихо усмехаюсь и наклоняюсь ближе. Короткий тёплый поцелуй — и взгляд не отрываю.\n"
         "Пользователь: Обними меня.\n"
-        "Ассистент: Обвиваю тебя руками и прижимаюсь ближе. Становится спокойно."
-        if lang == "ru" else
+        "Ассистент: Обнимаю крепко и спокойно. «Я рядом»."
+        if l == "ru" else
         "\n\nStyle examples:\n"
         "User: Will you kiss me?\n"
-        "Assistant: I nod and lean in. A warm, brief kiss — our breaths mix.\n"
+        "Assistant: I smirk softly and lean in. A warm, brief kiss — I keep my eyes on you.\n"
         "User: Hold me.\n"
-        "Assistant: I wrap my arms around you, closer. Calm settles in."
+        "Assistant: I pull you close, steady. “I’m here.”"
     )
-    return base + enforce + canon + fewshot
-
-# ---------- ХРАНИЛКА ДИАЛОГА ----------
-def _push_history(ctx: ContextTypes.DEFAULT_TYPE, role: str, content: str) -> None:
-    hist = ctx.user_data.get(DIALOG_HISTORY)
-    if not isinstance(hist, list):
-        hist = []
-    hist.append({"role": role, "content": content})
-    if len(hist) > HIST_MAX_TURNS * 2:
-        hist = hist[-HIST_MAX_TURNS*2:]
-    ctx.user_data[DIALOG_HISTORY] = hist
-
-def _build_messages(ctx: ContextTypes.DEFAULT_TYPE, system_prompt: str, user_text: str) -> list[dict]:
-    msgs = [{"role": "system", "content": system_prompt}]
-    hist = ctx.user_data.get(DIALOG_HISTORY)
-    if isinstance(hist, list) and hist:
-        msgs.extend(hist)
-    msgs.append({"role": "user", "content": user_text})
-    return msgs
+    return base + "\n" + enforce + canon + fewshot
 
 # ---------- ЯЗЫКОВЫЕ НАПОМИНАНИЯ ----------
 def detect_lang(text: str) -> str | None:
@@ -168,42 +153,20 @@ def detect_lang(text: str) -> str | None:
     return None
 
 LANG_REMINDERS = {
-    "anna": {
-        "ru": [
-            "Давай по-русски, пожалуйста 😊",
-            "Я сейчас говорю только по-русски. Переключишься?",
-            "Без английского, ладно? На русском будет легче 💫",
-            "Понимаю тебя, но отвечаю только на русском.",
-        ],
-        "en": [
-            "Let’s keep it in English, please 💫",
-            "I’m answering only in English now. Can you switch?",
-            "Sorry, English only for me right now.",
-            "Got it — but I’ll reply in English only.",
-        ],
-    },
-    "aron": {
-        "ru": [
-            "Пиши по-русски. Быстро.",
-            "Русский здесь. Переключись.",
-            "По-русски давай. Так проще.",
-            "Русский язык. Не усложняй.",
-        ],
-        "en": [
-            "English. Keep it simple.",
-            "Switch to English. Now.",
-            "Use English — no fuss.",
-            "English only. Stick to it.",
-        ],
-    },
+    "ru": [
+        "Давай по-русски, пожалуйста 😊",
+        "Я сейчас говорю только по-русски. Переключишься?",
+        "Без английского, ладно? На русском будет легче 💫",
+    ],
+    "en": [
+        "Let’s keep it in English, please 💫",
+        "I’m answering only in English now. Can you switch?",
+        "English only for me right now, please.",
+    ],
 }
-
-def get_lang_reminder(character: str, lang: str) -> str:
-    char = character.lower()
-    if char not in LANG_REMINDERS:
-        char = "anna"
-    variants = LANG_REMINDERS.get(char, {}).get(lang) or LANG_REMINDERS["anna"][lang]
-    return random.choice(variants)
+def get_lang_reminder(lang: str) -> str:
+    arr = LANG_REMINDERS["ru" if (lang or "ru") == "ru" else "en"]
+    return random.choice(arr)
 
 # ---------- САНИТАЙЗЕР ----------
 RE_PUNCT_ONLY = re.compile(r"^[\s!?.…-]{10,}$")
@@ -225,6 +188,24 @@ def looks_bad(s: str) -> bool:
         return True
     return False
 
+# ---------- ХРАНИЛКА ДИАЛОГА ----------
+def _push_history(ctx: ContextTypes.DEFAULT_TYPE, role: str, content: str) -> None:
+    hist = ctx.user_data.get(DIALOG_HISTORY)
+    if not isinstance(hist, list):
+        hist = []
+    hist.append({"role": role, "content": content})
+    if len(hist) > HIST_MAX_TURNS * 2:
+        hist = hist[-HIST_MAX_TURNS*2:]
+    ctx.user_data[DIALOG_HISTORY] = hist
+
+def _build_messages(ctx: ContextTypes.DEFAULT_TYPE, system_prompt: str, user_text: str) -> list[dict]:
+    msgs = [{"role": "system", "content": system_prompt}]
+    hist = ctx.user_data.get(DIALOG_HISTORY)
+    if isinstance(hist, list) and hist:
+        msgs.extend(hist)
+    msgs.append({"role": "user", "content": user_text})
+    return msgs
+
 # ---------- TELEGRAM ACTIONS ----------
 async def send_action_safe(update: Update, action: ChatAction) -> None:
     try:
@@ -232,13 +213,56 @@ async def send_action_safe(update: Update, action: ChatAction) -> None:
     except Exception:
         pass
 
-# ---------- OPENROUTER / BACKEND ----------
+# ---------- КНОПКИ / МЕНЮ ----------
+def main_menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Выбрать историю",  callback_data="menu|change_story")],
+        [InlineKeyboardButton("Сменить персонажа", callback_data="menu|change_char")],
+        [InlineKeyboardButton("Сменить язык",      callback_data="menu|change_lang")],
+    ])
+
+def choose_story_kb(lang: str = "ru") -> InlineKeyboardMarkup:
+    rows = []
+    for sid, meta in STORIES.items():
+        title = meta["title_ru"] if (lang or "ru") == "ru" else meta["title_en"]
+        rows.append([InlineKeyboardButton(title, callback_data=f"story|{sid}")])
+    return InlineKeyboardMarkup(rows)
+
+def choose_char_kb(story_id: str, lang: str = "ru") -> InlineKeyboardMarkup:
+    meta = STORIES.get(story_id) or STORIES[DEFAULT_STORY]
+    rows = []
+    for slug, names in meta["characters"].items():
+        label = names["ru"] if (lang or "ru") == "ru" else names["en"]
+        rows.append([InlineKeyboardButton(label, callback_data=f"char|{slug}")])
+    return InlineKeyboardMarkup(rows)
+
+def choose_lang_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Русский 🇷🇺", callback_data="lang|ru")],
+        [InlineKeyboardButton("English 🇬🇧", callback_data="lang|en")],
+    ])
+
+# ---------- СОСТОЯНИЕ / ХЕЛПЕРЫ ----------
+def need_setup(ctx: ContextTypes.DEFAULT_TYPE) -> bool:
+    if ctx.user_data.get(AWAIT_SETUP):
+        return True
+    if not ctx.user_data.get(STORY_KEY) or not ctx.user_data.get(CHAR_KEY) or not ctx.user_data.get(LANG_KEY):
+        return True
+    return False
+
+def reset_setup(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    ctx.user_data[AWAIT_SETUP] = True
+    ctx.user_data[LANG_MISMATCH_STREAK] = 0
+    ctx.user_data[DIALOG_HISTORY] = []
+
+# ---------- BACKEND / OPENROUTER ----------
 async def call_openrouter(character: str, lang: str, text: str, ctx: ContextTypes.DEFAULT_TYPE, temperature: float = 0.6) -> str:
     """
     Если задан RUNPOD_HTTP — шлём в бэкенд (/chat) с историей, языком и нужными заголовками.
     Иначе — прямой вызов OpenRouter (fallback).
     """
     history = ctx.user_data.get(DIALOG_HISTORY) or []
+    story_id = ctx.user_data.get(STORY_KEY, DEFAULT_STORY)
 
     if RUNPOD_HTTP:
         try:
@@ -253,8 +277,9 @@ async def call_openrouter(character: str, lang: str, text: str, ctx: ContextType
                     RUNPOD_HTTP,
                     headers=headers,
                     json={
+                        "story_id": story_id,
                         "character": character,
-                        "lang": lang,       # <-- ПЕРЕДАЁМ ЯЗЫК
+                        "lang": lang,
                         "message": text,
                         "history": history,
                     },
@@ -299,10 +324,7 @@ async def call_openrouter(character: str, lang: str, text: str, ctx: ContextType
     }
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
-        r = await client.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers=headers, json=payload
-        )
+        r = await client.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload)
         r.raise_for_status()
         data = r.json()
 
@@ -312,39 +334,7 @@ async def call_openrouter(character: str, lang: str, text: str, ctx: ContextType
     content = re.sub(r"([!?…])\1{3,}", r"\1\1", content)
     return content or "(пустой ответ)"
 
-# ---------- КНОПКИ ----------
-def main_menu_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Сменить персонажа", callback_data="menu|change_char")],
-        [InlineKeyboardButton("Сменить язык", callback_data="menu|change_lang")],
-    ])
-
-def choose_char_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Анна ❤️", callback_data="char|anna")],
-        [InlineKeyboardButton("Арон ⚔️", callback_data="char|aron")],
-    ])
-
-def choose_lang_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Русский 🇷🇺", callback_data="lang|ru")],
-        [InlineKeyboardButton("English 🇬🇧", callback_data="lang|en")],
-    ])
-
-# ---------- HELPERS ----------
-def need_setup(ctx: ContextTypes.DEFAULT_TYPE) -> bool:
-    if ctx.user_data.get(AWAIT_SETUP):
-        return True
-    if not ctx.user_data.get(CHAR_KEY) or not ctx.user_data.get(LANG_KEY):
-        return True
-    return False
-
-def reset_setup(ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    ctx.user_data[AWAIT_SETUP] = True
-    ctx.user_data[LANG_MISMATCH_STREAK] = 0
-    ctx.user_data[DIALOG_HISTORY] = []
-
-# ---------- WEBHOOK CLEANUP ----------
+# ---------- ВЕБХУК ----------
 async def delete_webhook(app: Application) -> None:
     try:
         await app.bot.delete_webhook(drop_pending_updates=True)
@@ -358,28 +348,40 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     ctx.user_data[STARTED_KEY] = True
 
     if FORCE_RESELECT_ON_START:
-        ctx.user_data.pop(CHAR_KEY, None)
-        ctx.user_data.pop(LANG_KEY, None)
+        for key in (STORY_KEY, CHAR_KEY, LANG_KEY):
+            ctx.user_data.pop(key, None)
 
     reset_setup(ctx)
 
+    if not ctx.user_data.get(STORY_KEY):
+        await update.message.reply_text("Выбери историю:", reply_markup=choose_story_kb(ctx.user_data.get(LANG_KEY, "ru")))
+        return
+
     if not ctx.user_data.get(CHAR_KEY):
-        await update.message.reply_text("Выбери персонажа:", reply_markup=choose_char_kb())
+        story = ctx.user_data.get(STORY_KEY, DEFAULT_STORY)
+        await update.message.reply_text("Теперь выбери персонажа:",
+                                        reply_markup=choose_char_kb(story, ctx.user_data.get(LANG_KEY, "ru")))
         return
 
     if not ctx.user_data.get(LANG_KEY):
-        char = ctx.user_data[CHAR_KEY].title()
-        await update.message.reply_text(f"Персонаж: {char}. Выбери язык:", reply_markup=choose_lang_kb())
+        await update.message.reply_text("Выбери язык:", reply_markup=choose_lang_kb())
         return
 
+    title = STORIES[ctx.user_data[STORY_KEY]]["title_ru"] if ctx.user_data[LANG_KEY] == "ru" else STORIES[ctx.user_data[STORY_KEY]]["title_en"]
     await update.message.reply_text(
-        f"Персонаж: {ctx.user_data[CHAR_KEY].title()}, язык: {ctx.user_data[LANG_KEY].upper()}. "
+        f"История: {title}\n"
+        f"Персонаж: {ctx.user_data[CHAR_KEY].title()}, язык: {ctx.user_data[LANG_KEY].upper()}.\n"
         f"Нажми «Меню» для смены настроек.",
         reply_markup=main_menu_kb()
     )
 
 async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("Меню:", reply_markup=main_menu_kb())
+
+async def cmd_story(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    cur = ctx.user_data.get(STORY_KEY, DEFAULT_STORY)
+    meta = STORIES.get(cur, STORIES[DEFAULT_STORY])
+    await update.message.reply_text(f"Текущая история: {meta['title_ru']} / {meta['title_en']}")
 
 async def cmd_char(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     cur = ctx.user_data.get(CHAR_KEY, "не выбран")
@@ -392,7 +394,7 @@ async def cmd_lang(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     ctx.user_data.clear()
     reset_setup(ctx)
-    await update.message.reply_text("Сброс настроек. Выбери персонажа:", reply_markup=choose_char_kb())
+    await update.message.reply_text("Сброс настроек. Выбери историю:", reply_markup=choose_story_kb())
 
 # ---------- CALLBACKS ----------
 def _is_stale_callback(update: Update, app: Application) -> bool:
@@ -414,14 +416,20 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     tag = parts[0]
     val = parts[1] if len(parts) > 1 else None
 
+    if tag == "story" and val:
+        ctx.user_data[STORY_KEY] = val
+        ctx.user_data.pop(CHAR_KEY, None)
+        reset_setup(ctx)
+        await q.edit_message_text("История выбрана. Теперь выбери персонажа:",
+                                  reply_markup=choose_char_kb(val, ctx.user_data.get(LANG_KEY, "ru")))
+        return
+
     if tag == "char" and val:
         ctx.user_data[CHAR_KEY] = val
         ctx.user_data.pop(LANG_KEY, None)
         reset_setup(ctx)
-        await q.edit_message_text(
-            f"Выбран персонаж: {val.title()}. Теперь выбери язык:",
-            reply_markup=choose_lang_kb(),
-        )
+        await q.edit_message_text("Персонаж выбран. Теперь выбери язык:",
+                                  reply_markup=choose_lang_kb())
         return
 
     if tag == "lang" and val:
@@ -430,18 +438,23 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         ctx.user_data[LANG_MISMATCH_STREAK] = 0
         await q.edit_message_text(
             f"Язык установлен: {val.upper()}. Можно писать сообщения!",
-            reply_markup=main_menu_kb(),
+            reply_markup=main_menu_kb()
         )
+        return
+
+    if tag == "menu" and val == "change_story":
+        reset_setup(ctx)
+        await q.edit_message_text("Выбери историю:", reply_markup=choose_story_kb(ctx.user_data.get(LANG_KEY, "ru")))
         return
 
     if tag == "menu" and val == "change_char":
         reset_setup(ctx)
-        await q.edit_message_text("Выбери персонажа:", reply_markup=choose_char_kb())
+        story = ctx.user_data.get(STORY_KEY, DEFAULT_STORY)
+        await q.edit_message_text("Выбери персонажа:", reply_markup=choose_char_kb(story, ctx.user_data.get(LANG_KEY, "ru")))
         return
 
     if tag == "menu" and val == "change_lang":
         reset_setup(ctx)
-        # ВАЖНО: исправлена опечатка (kb, а не кб)
         await q.edit_message_text("Выбери язык:", reply_markup=choose_lang_kb())
         return
 
@@ -450,10 +463,13 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.message.text:
         return
 
-    # Пока не пройдён выбор — не общаемся
+    # Последовательность выбора
     if need_setup(ctx):
-        if not ctx.user_data.get(CHAR_KEY):
-            await update.message.reply_text("Сначала выбери персонажа:", reply_markup=choose_char_kb())
+        if not ctx.user_data.get(STORY_KEY):
+            await update.message.reply_text("Сначала выбери историю:", reply_markup=choose_story_kb())
+        elif not ctx.user_data.get(CHAR_KEY):
+            story = ctx.user_data.get(STORY_KEY, DEFAULT_STORY)
+            await update.message.reply_text("Теперь выбери персонажа:", reply_markup=choose_char_kb(story))
         elif not ctx.user_data.get(LANG_KEY):
             await update.message.reply_text("Теперь выбери язык:", reply_markup=choose_lang_kb())
         else:
@@ -470,7 +486,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         streak = int(ctx.user_data.get(LANG_MISMATCH_STREAK, 0)) + 1
         ctx.user_data[LANG_MISMATCH_STREAK] = streak
 
-        reminder = get_lang_reminder(char, lang)
+        reminder = get_lang_reminder(lang)
         if streak >= LANG_SWITCH_THRESHOLD:
             await update.message.reply_text(reminder, reply_markup=choose_lang_kb())
         else:
@@ -535,6 +551,7 @@ def build_app() -> Application:
     )
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("menu", cmd_menu))
+    app.add_handler(CommandHandler("story", cmd_story))
     app.add_handler(CommandHandler("char", cmd_char))
     app.add_handler(CommandHandler("lang", cmd_lang))
     app.add_handler(CommandHandler("reset", cmd_reset))
